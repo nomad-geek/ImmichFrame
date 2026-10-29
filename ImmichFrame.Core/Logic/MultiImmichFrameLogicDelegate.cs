@@ -27,11 +27,11 @@ public class MultiImmichFrameLogicDelegate : IImmichFrameLogic, IDisposable
         _accountSelectionStrategy = strategyFactory(_accountToDelegate.Values.ToList());
     }
 
-    public async Task<AssetResponseDto?> GetNextAsset() => (await _accountSelectionStrategy.GetNextAsset())?.ToAsset();
+    public async Task<AssetResponseDto?> GetNextAsset(string clientId = "") => (await _accountSelectionStrategy.GetNextAsset(clientId))?.ToAsset();
 
 
-    public async Task<IEnumerable<AssetResponseDto>> GetAssets()
-        => (await _accountSelectionStrategy.GetAssets()).Shuffle().Select(it => it.ToAsset());
+    public async Task<IEnumerable<AssetResponseDto>> GetAssets(string clientId = "")
+        => (await _accountSelectionStrategy.GetAssets(clientId)).Shuffle().Select(it => it.ToAsset());
 
 
     public Task<AssetResponseDto> GetAssetInfoById(Guid assetId)

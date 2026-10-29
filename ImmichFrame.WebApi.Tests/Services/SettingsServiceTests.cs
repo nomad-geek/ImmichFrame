@@ -1,4 +1,5 @@
 using ImmichFrame.Core.Interfaces;
+using ImmichFrame.Core.Models;
 using ImmichFrame.WebApi.Database;
 using ImmichFrame.WebApi.Helpers.Config;
 using ImmichFrame.WebApi.Models;
@@ -71,6 +72,61 @@ namespace ImmichFrame.WebApi.Tests.Services
                 Assert.That(service.Current.Accounts.Single().ApiKey, Is.EqualTo("key123"));
                 Assert.That(File.Exists(Path.Combine(_configDir, "immichframe.db")), Is.True);
             });
+        }
+
+        [Test]
+        public async Task InitializeAsync_ShuffleModeDefaultsToRandom()
+        {
+            WriteSettingsJson(ValidV2Json);
+
+            var service = CreateService();
+            await service.InitializeAsync();
+
+            Assert.That(service.Current.Accounts.Single().ShuffleMode, Is.EqualTo(ShuffleMode.Random));
+        }
+
+        [Test]
+        public async Task InitializeAsync_ReadsShuffleMode()
+        {
+            WriteSettingsJson("""
+                {
+                    "Accounts": [ { "ImmichServerUrl": "http://immich.local", "ApiKey": "key123", "ShuffleMode": "Exhaustive" } ]
+                }
+                """);
+
+            var service = CreateService();
+            await service.InitializeAsync();
+
+            Assert.That(service.Current.Accounts.Single().ShuffleMode, Is.EqualTo(ShuffleMode.Exhaustive));
+        }
+
+        [Test]
+        public void ShuffleMode_SurvivesStoredRoundTrip()
+        {
+            var settings = new ServerSettings
+            {
+                AccountsImpl = new List<ServerAccountSettings> { new() { ShuffleMode = ShuffleMode.Exhaustive } }
+            };
+
+            var json = SettingsService.Serialize(settings);
+            var restored = System.Text.Json.JsonSerializer.Deserialize<ServerSettings>(json)!;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(json, Does.Contain("\"ShuffleMode\":\"Exhaustive\""));
+                Assert.That(restored.AccountsImpl.Single().ShuffleMode, Is.EqualTo(ShuffleMode.Exhaustive));
+            });
+        }
+
+        [Test]
+        public void ShuffleMode_ReadsCamelCaseValue()
+        {
+            // The admin API writes enum values in camelCase.
+            const string json = """{ "Accounts": [ { "ShuffleMode": "exhaustive" } ] }""";
+
+            var restored = System.Text.Json.JsonSerializer.Deserialize<ServerSettings>(json)!;
+
+            Assert.That(restored.AccountsImpl.Single().ShuffleMode, Is.EqualTo(ShuffleMode.Exhaustive));
         }
 
         [Test]

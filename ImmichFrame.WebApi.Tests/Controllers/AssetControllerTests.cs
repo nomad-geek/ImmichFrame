@@ -152,6 +152,22 @@ namespace ImmichFrame.WebApi.Tests.Controllers
             Assert.That(content, Is.Not.Empty);
         }
 
+        [Test]
+        public async Task GetAssets_PassesSanitizedClientIdentifierToLogic()
+        {
+            var logic = new Mock<IImmichFrameLogic>();
+            logic.Setup(l => l.GetAssets(It.IsAny<string>()))
+                .ReturnsAsync(new List<AssetResponseDto>());
+            using var factory = _factory.WithWebHostBuilder(builder =>
+                builder.ConfigureTestServices(services => services.AddSingleton(logic.Object)));
+            var client = factory.CreateClient();
+
+            var response = await client.GetAsync("/api/Asset?clientIdentifier=ab-cd");
+
+            response.EnsureSuccessStatusCode();
+            logic.Verify(l => l.GetAssets("abcd"), Times.Once);
+        }
+
         // Builds a valid AssetResponseDto from the generated client types. Only the
         // fields required by the schema are set; pass type/duration to reuse this for
         // video assets. Changes to the OpenAPI schema surface here as compile errors.

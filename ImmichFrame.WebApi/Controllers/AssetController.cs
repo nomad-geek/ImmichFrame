@@ -39,7 +39,7 @@ namespace ImmichFrame.WebApi.Controllers
         {
             var sanitizedClientIdentifier = clientIdentifier.SanitizeString();
             _logger.LogDebug("Assets requested by '{sanitizedClientIdentifier}'", sanitizedClientIdentifier);
-            return (await _logic.GetAssets()).ToList();
+            return (await _logic.GetAssets(sanitizedClientIdentifier)).ToList();
         }
 
         [HttpGet("{id}/AssetInfo", Name = "GetAssetInfo")]
@@ -143,7 +143,7 @@ namespace ImmichFrame.WebApi.Controllers
             const int maxAttempts = 10;
             for (int i = 0; i < maxAttempts; i++)
             {
-                var candidate = await _logic.GetNextAsset();
+                var candidate = await _logic.GetNextAsset(sanitizedClientIdentifier);
                 if (candidate == null) break;
                 if (candidate.Type == AssetTypeEnum.IMAGE)
                 {

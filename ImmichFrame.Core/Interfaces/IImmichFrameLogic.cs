@@ -6,8 +6,8 @@ namespace ImmichFrame.Core.Interfaces
 {
     public interface IImmichFrameLogic
     {
-        public Task<AssetResponseDto?> GetNextAsset();
-        public Task<IEnumerable<AssetResponseDto>> GetAssets();
+        public Task<AssetResponseDto?> GetNextAsset(string clientId = "");
+        public Task<IEnumerable<AssetResponseDto>> GetAssets(string clientId = "");
         public Task<AssetResponseDto> GetAssetInfoById(Guid assetId);
         public Task<IEnumerable<AssetFaceResponseDto>> GetAssetFacesById(Guid assetId);
         public Task<IEnumerable<AlbumResponseDto>> GetAlbumInfoById(Guid assetId);
@@ -19,13 +19,13 @@ namespace ImmichFrame.Core.Interfaces
     public interface IAccountImmichFrameLogic : IImmichFrameLogic
     {
         public IAccountSettings AccountSettings { get; }
-
+        public Task<IEnumerable<AssetResponseDto>> GetAssets(int count, string clientId);
     }
 
     public interface IAccountSelectionStrategy
     {
-        Task<(IAccountImmichFrameLogic, AssetResponseDto)?> GetNextAsset();
-        Task<IEnumerable<(IAccountImmichFrameLogic, AssetResponseDto)>> GetAssets();
+        Task<(IAccountImmichFrameLogic, AssetResponseDto)?> GetNextAsset(string clientId = "");
+        Task<IEnumerable<(IAccountImmichFrameLogic, AssetResponseDto)>> GetAssets(string clientId = "");
         T ForAsset<T>(Guid assetId, Func<IAccountImmichFrameLogic, T> f);
     }
 }

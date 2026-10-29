@@ -9,6 +9,8 @@ namespace ImmichFrame.Core.Logic;
 
 public class PooledImmichFrameLogic : IAccountImmichFrameLogic, IDisposable
 {
+    private const int BatchSize = 25;
+
     private readonly IGeneralSettings _generalSettings;
     private readonly IApiCache _apiCache;
     private readonly IAssetPool _pool;
@@ -46,25 +48,31 @@ public class PooledImmichFrameLogic : IAccountImmichFrameLogic, IDisposable
         // Memories-only skips the library search. Every other case needs it.
         if (!accountSettings.ShowMemories || hasSource)
         {
-            pools.Add(new AccountSearchPool(_apiCache, _immichApi, accountSettings));
+            pools.Add(ApplyShuffleMode(new AccountSearchPool(_apiCache, _immichApi, accountSettings), accountSettings.ShuffleMode));
         }
 
         if (accountSettings.ShowMemories)
         {
-            pools.Add(new MemoryAssetsPool(_immichApi, accountSettings));
+            pools.Add(ApplyShuffleMode(new MemoryAssetsPool(_immichApi, accountSettings), accountSettings.ShuffleMode));
         }
 
         return pools.Count == 1 ? pools[0] : new MultiAssetPool(pools);
     }
 
-    public async Task<AssetResponseDto?> GetNextAsset()
+    // Exhaustive mode deals each source from its own deck; Random mode keeps the source as it is.
+    internal static IAssetPool ApplyShuffleMode(IDealableAssetPool pool, ShuffleMode mode)
+        => mode == ShuffleMode.Exhaustive ? new ShuffleDeckPool(pool) : pool;
+
+    public async Task<AssetResponseDto?> GetNextAsset(string clientId = "")
     {
-        return (await _pool.GetAssets(1)).FirstOrDefault();
+        return (await _pool.GetAssets(1, clientId)).FirstOrDefault();
     }
 
-    public async Task<IEnumerable<AssetResponseDto>> GetAssets()
+    public Task<IEnumerable<AssetResponseDto>> GetAssets(string clientId = "") => GetAssets(BatchSize, clientId);
+
+    public async Task<IEnumerable<AssetResponseDto>> GetAssets(int count, string clientId)
     {
-        return await _pool.GetAssets(25);
+        return await _pool.GetAssets(count, clientId);
     }
 
     public async Task<AssetResponseDto> GetAssetInfoById(Guid assetId) => await _immichApi.GetAssetInfoAsync(assetId, null, null);

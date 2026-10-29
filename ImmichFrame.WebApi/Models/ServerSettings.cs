@@ -1,4 +1,5 @@
-﻿using System.Text.Json.Serialization;
+﻿using ImmichFrame.Core.Models;
+using System.Text.Json.Serialization;
 using ImmichFrame.Core.Interfaces;
 using YamlDotNet.Serialization;
 
@@ -94,6 +95,7 @@ public class ServerAccountSettings : IAccountSettings
     public List<Guid> People { get; set; } = new();
     public List<string> Tags { get; set; } = new();
     public int? Rating { get; set; }
+    public ShuffleMode ShuffleMode { get; set; } = ShuffleMode.Random;
 
     public void ValidateAndInitialize()
     {

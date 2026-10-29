@@ -23,6 +23,8 @@ public class AccountSearchPoolTests
             .Returns<string, Func<Task<ICollection<TagResponseDto>>>>((_, factory) => factory());
         _cache.Setup(c => c.GetOrAddAsync(It.IsAny<string>(), It.IsAny<Func<Task<long>>>()))
             .Returns<string, Func<Task<long>>>((_, factory) => factory());
+        _cache.Setup(c => c.GetOrAddAsync(It.IsAny<string>(), It.IsAny<Func<Task<IReadOnlyList<Guid>>>>()))
+            .Returns<string, Func<Task<IReadOnlyList<Guid>>>>((_, factory) => factory());
         _api = new Mock<ImmichApi>(null, null);
         _api.Setup(a => a.SearchRandomAsync(It.IsAny<RandomSearchDto>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new List<AssetResponseDto>());
@@ -253,6 +255,191 @@ public class AccountSearchPoolTests
 
         _api.Verify(a => a.SearchAssetStatisticsAsync(It.IsAny<StatisticsSearchDto>(), It.IsAny<CancellationToken>()), Times.Once);
     }
+
+    [Test]
+    public async Task GetAllAssetIds_PagesWithTheCursor()
+    {
+        var excludedAlbumId = Guid.NewGuid();
+        _settings.SetupGet(s => s.ShowFavorites).Returns(true);
+        _settings.SetupGet(s => s.ExcludedAlbums).Returns(new List<Guid> { excludedAlbumId });
+        var page1 = Ids("page1", 3);
+        var page2 = Ids("page2", 2);
+        var page3 = Ids("page3", 1);
+        var requests = new List<MetadataSearchDto>();
+        _api.Setup(a => a.SearchAssetsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MetadataSearchDto>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string key, string slug, MetadataSearchDto dto, CancellationToken ct) =>
+            {
+                requests.Add(dto);
+                return dto.Cursor switch
+                {
+                    null => SearchPage(page1, "cursor-1"),
+                    "cursor-1" => SearchPage(page2, "cursor-2"),
+                    "cursor-2" => SearchPage(page3, null),
+                    _ => throw new InvalidOperationException($"Unexpected cursor {dto.Cursor}")
+                };
+            });
+
+        var ids = await _pool.GetAllAssetIds();
+
+        Assert.That(ids, Is.EqualTo(page1.Concat(page2).Concat(page3)));
+        Assert.That(requests, Has.Count.EqualTo(3));
+        Assert.Multiple(() =>
+        {
+            Assert.That(requests[0].Cursor, Is.Null);
+            Assert.That(requests[1].Cursor, Is.EqualTo("cursor-1"));
+            Assert.That(requests[2].Cursor, Is.EqualTo("cursor-2"));
+            foreach (var dto in requests)
+            {
+                Assert.That(dto.Size, Is.EqualTo(1000));
+                Assert.That(dto.WithExif, Is.False);
+                Assert.That(dto.Filter!.Or.Any(branch => branch.IsFavorite != null && branch.IsFavorite.Eq), Is.True);
+                Assert.That(dto.Filter.AlbumIds!.None, Does.Contain(excludedAlbumId));
+                Assert.That(dto.Filter.TrashedAt, Is.Not.Null);
+                Assert.That(dto.Filter.Visibility!.In, Does.Contain(AssetVisibility.Timeline));
+                Assert.That(dto.Filter.Type!.In, Does.Contain(AssetTypeEnum.IMAGE));
+            }
+        });
+        _api.Verify(a => a.SearchRandomAsync(It.IsAny<RandomSearchDto>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Test]
+    public async Task GetAllAssetIds_UnmatchedTagsOnly_IsEmptyWithoutSearch()
+    {
+        _settings.SetupGet(s => s.Tags).Returns(new List<string> { "missing" });
+        _api.Setup(a => a.GetAllTagsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<TagResponseDto>());
+
+        var ids = await _pool.GetAllAssetIds();
+
+        Assert.That(ids, Is.Empty);
+        _api.Verify(a => a.SearchAssetsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MetadataSearchDto>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Test]
+    public async Task LoadAssetsByIds_KeepsTheInputOrder()
+    {
+        var ids = Ids("ordered", 8);
+        for (var i = 0; i < ids.Count; i++)
+        {
+            var id = ids[i];
+            // Later IDs answer sooner, so completion order differs from input order.
+            var delay = TimeSpan.FromMilliseconds((ids.Count - i) * 10);
+            _api.Setup(a => a.GetAssetInfoAsync(id, It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    await Task.Delay(delay);
+                    return Asset(id);
+                });
+        }
+
+        var loaded = await _pool.LoadAssetsByIds(ids);
+
+        Assert.That(loaded.Select(a => a.Id), Is.EqualTo(ids));
+    }
+
+    [Test]
+    public async Task LoadAssetsByIds_SkipsDeletedAndTrashedAssets()
+    {
+        var kept1 = FixtureHelpers.GuidFor("kept1");
+        var deleted = FixtureHelpers.GuidFor("deleted");
+        var trashed = FixtureHelpers.GuidFor("trashed");
+        var kept2 = FixtureHelpers.GuidFor("kept2");
+        SetupAssetInfo(kept1);
+        _api.Setup(a => a.GetAssetInfoAsync(deleted, It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(ApiError(404));
+        _api.Setup(a => a.GetAssetInfoAsync(trashed, It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AssetResponseDto { Id = trashed, Type = AssetTypeEnum.IMAGE, IsTrashed = true });
+        SetupAssetInfo(kept2);
+
+        var loaded = await _pool.LoadAssetsByIds(new List<Guid> { kept1, deleted, trashed, kept2 });
+
+        Assert.That(loaded.Select(a => a.Id), Is.EqualTo(new[] { kept1, kept2 }));
+    }
+
+    [Test]
+    public void LoadAssetsByIds_ServerError_IsRethrown()
+    {
+        var kept = FixtureHelpers.GuidFor("kept");
+        var failing = FixtureHelpers.GuidFor("failing");
+        SetupAssetInfo(kept);
+        _api.Setup(a => a.GetAssetInfoAsync(failing, It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(ApiError(500));
+
+        var ex = Assert.ThrowsAsync<ApiException>(() => _pool.LoadAssetsByIds(new List<Guid> { kept, failing }));
+
+        Assert.That(ex!.StatusCode, Is.EqualTo(500));
+    }
+
+    [Test]
+    public async Task GetAssets_RandomMode_NeverListsOrLoadsById()
+    {
+        await _pool.GetAssets(25, "frame-1");
+
+        VerifyRandom(dto => dto.Size == 25);
+        _api.Verify(a => a.SearchAssetsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MetadataSearchDto>(), It.IsAny<CancellationToken>()), Times.Never);
+        _api.Verify(a => a.GetAssetInfoAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Test]
+    public async Task GetAssets_ExhaustiveMode_ListsAndLoadsByIdWithoutRandomSearch()
+    {
+        var ids = Ids("exhaustive", 10);
+        _api.Setup(a => a.SearchAssetsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MetadataSearchDto>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SearchPage(ids, null));
+        foreach (var id in ids)
+        {
+            SetupAssetInfo(id);
+        }
+
+        var dealer = new ShuffleDeckPool(_pool);
+
+        var result = (await dealer.GetAssets(5, "frame-1")).ToList();
+
+        Assert.That(result, Has.Count.EqualTo(5));
+        Assert.That(result.Select(a => a.Id), Is.Unique);
+        Assert.That(ids, Is.SupersetOf(result.Select(a => a.Id)));
+        _api.Verify(a => a.SearchAssetsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MetadataSearchDto>(), It.IsAny<CancellationToken>()), Times.Once);
+        _api.Verify(a => a.GetAssetInfoAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Exactly(5));
+        _api.Verify(a => a.SearchRandomAsync(It.IsAny<RandomSearchDto>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    private static List<Guid> Ids(string prefix, int count) =>
+        Enumerable.Range(0, count).Select(i => FixtureHelpers.GuidFor($"{prefix}_{i}")).ToList();
+
+    private static AssetResponseDto Asset(Guid id) => new()
+    {
+        Id = id,
+        Type = AssetTypeEnum.IMAGE,
+        IsTrashed = false,
+        ExifInfo = new ExifResponseDto()
+    };
+
+    private void SetupAssetInfo(Guid id) =>
+        _api.Setup(a => a.GetAssetInfoAsync(id, It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Asset(id));
+
+    private static ApiException ApiError(int statusCode) =>
+        new($"Status {statusCode}", statusCode, string.Empty, new Dictionary<string, IEnumerable<string>>(), null);
+
+    internal static SearchResponseDto SearchPage(IReadOnlyCollection<Guid> ids, string? nextCursor) => new()
+    {
+        Albums = new SearchAlbumResponseDto
+        {
+            Count = 0,
+            Total = 0,
+            Items = new List<AlbumResponseDto>(),
+            Facets = new List<SearchFacetResponseDto>()
+        },
+        Assets = new SearchAssetResponseDto
+        {
+            Count = ids.Count,
+            Total = ids.Count,
+            Items = ids.Select(id => new AssetResponseDto { Id = id, Type = AssetTypeEnum.IMAGE }).ToList(),
+            Facets = new List<SearchFacetResponseDto>(),
+            NextCursor = nextCursor,
+            NextPage = null
+        }
+    };
 
     private void VerifyRandom(Func<RandomSearchDto, bool> match) =>
         _api.Verify(a => a.SearchRandomAsync(It.Is<RandomSearchDto>(dto => match(dto)), It.IsAny<CancellationToken>()), Times.Once);

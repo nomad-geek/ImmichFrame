@@ -11,12 +11,12 @@ public class MultiAssetPool(IEnumerable<IAssetPool> delegates) : AggregatingAsse
         return (await Task.WhenAll(counts)).Sum();
     }
 
-    protected override async Task<AssetResponseDto?> GetNextAsset(CancellationToken ct)
+    protected override async Task<AssetResponseDto?> GetNextAsset(string clientId, CancellationToken ct)
     {
         var pool = await delegates.ChooseOne(async @delegate=> await @delegate.GetAssetCount(ct));
         
         if (pool == null) return null;
         
-        return (await pool.GetAssets(1, ct)).FirstOrDefault();
+        return (await pool.GetAssets(1, clientId, ct)).FirstOrDefault();
     }
 }
