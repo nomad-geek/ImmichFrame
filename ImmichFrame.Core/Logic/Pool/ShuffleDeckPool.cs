@@ -4,21 +4,34 @@ namespace ImmichFrame.Core.Logic.Pool;
 
 /// <summary>
 /// Deals a source's assets from a shuffled deck, so every asset is shown once before any repeats.
-/// Each client gets its own deck; callers without a client ID share one.
+/// Each client gets its own deck; callers without a client ID, and clients turned away by the
+/// limits below, share one.
 /// </summary>
 public class ShuffleDeckPool(IDealableAssetPool source, TimeProvider? timeProvider = null) : IAssetPool
 {
-    // The client ID comes from the caller, so the number and size of decks are bounded.
+    // The client ID comes from the caller, so the number of decks, and how fast new ones appear, are bounded.
     public const int MaxDecks = 32;
     public const int MaxClientIdLength = 64;
     public static readonly TimeSpan IdleExpiry = TimeSpan.FromHours(24);
 
-    // Rounds of extra dealing when some dealt assets could not be loaded (deleted or trashed).
+    /// <summary>Past this many client decks, at most one new deck is made per <see cref="NewDeckInterval"/>.</summary>
+    public const int RateLimitedAbove = 8;
+    public static readonly TimeSpan NewDeckInterval = TimeSpan.FromMinutes(1);
+
+    /// <summary>A deck used this recently is never evicted to make room for a new one.</summary>
+    public static readonly TimeSpan ProtectedFor = TimeSpan.FromMinutes(10);
+
+    // Rounds of extra dealing when some dealt assets could not be loaded (deleted, trashed or filtered out).
     private const int MaxTopUpRounds = 3;
 
     private readonly TimeProvider _time = timeProvider ?? TimeProvider.System;
-    private readonly object _gate = new();
+
+    // Guards only the registry below. Each deck is locked on its own entry, so syncing or
+    // shuffling a large deck never holds up other clients.
+    private readonly object _registryGate = new();
     private readonly Dictionary<string, DeckEntry> _decks = new(StringComparer.Ordinal);
+    private readonly DeckEntry _shared = new(new ShuffleDeck(new Random()), DateTimeOffset.MinValue);
+    private DateTimeOffset _lastDeckCreated = DateTimeOffset.MinValue;
 
     private sealed class DeckEntry(ShuffleDeck deck, DateTimeOffset lastUsed)
     {
@@ -35,45 +48,71 @@ public class ShuffleDeckPool(IDealableAssetPool source, TimeProvider? timeProvid
             return [];
         }
 
-        var key = NormalizeClientId(clientId);
-        var ids = await source.GetAllAssetIds(ct);
+        var list = await source.GetAllAssetIds(ct);
+        var entry = GetDeck(NormalizeClientId(clientId));
 
         var assets = new List<AssetResponseDto>(requested);
         var seen = new HashSet<Guid>();
-        for (var round = 0; round <= MaxTopUpRounds && assets.Count < requested; round++)
+        // Dealt but not shown: they go back to the deck when this call ends.
+        var unshown = new List<Guid>();
+        IReadOnlyList<Guid> pending = [];
+        try
         {
-            IReadOnlyList<Guid> dealt;
-            lock (_gate)
+            for (var round = 0; round <= MaxTopUpRounds && assets.Count < requested; round++)
             {
-                var deck = GetOrCreateDeck(key);
-                if (!ReferenceEquals(deck.SyncedSource, ids))
+                lock (entry)
                 {
-                    deck.Sync(ids);
-                    deck.SyncedSource = ids;
+                    entry.Deck.Sync(list);
+                    var dealt = entry.Deck.Deal(requested - assets.Count);
+                    // A card dealt again after the deck wrapped within this call counts for the next cycle.
+                    pending = dealt.Where(seen.Add).ToList();
+                    unshown.AddRange(dealt.Except(pending));
                 }
 
-                dealt = deck.Deal(requested - assets.Count).Where(seen.Add).ToList();
-            }
+                if (pending.Count == 0)
+                {
+                    break;
+                }
 
-            if (dealt.Count == 0)
+                var result = await source.LoadAssetsByIds(pending, ct);
+                pending = [];
+                assets.AddRange(result.Loaded);
+                unshown.AddRange(result.Retry);
+            }
+        }
+        finally
+        {
+            unshown.AddRange(pending);
+            if (unshown.Count > 0)
             {
-                break;
+                lock (entry)
+                {
+                    entry.Deck.Return(unshown);
+                }
             }
-
-            assets.AddRange(await source.LoadAssetsByIds(dealt, ct));
         }
 
         return assets;
     }
 
+    /// <summary>The number of client decks, not counting the shared one.</summary>
     internal int DeckCount
     {
         get
         {
-            lock (_gate)
+            lock (_registryGate)
             {
                 return _decks.Count;
             }
+        }
+    }
+
+    /// <summary>The listing a client's own deck deals from, or null when it has none.</summary>
+    internal AssetIdList? ListingOf(string clientId)
+    {
+        lock (_registryGate)
+        {
+            return _decks.TryGetValue(NormalizeClientId(clientId), out var entry) ? entry.Deck.Listing : null;
         }
     }
 
@@ -83,29 +122,57 @@ public class ShuffleDeckPool(IDealableAssetPool source, TimeProvider? timeProvid
         return key.Length > MaxClientIdLength ? key[..MaxClientIdLength] : key;
     }
 
-    private ShuffleDeck GetOrCreateDeck(string key)
+    // Finds or makes the deck for this key. Never does work proportional to the deck size.
+    private DeckEntry GetDeck(string key)
     {
-        var now = _time.GetUtcNow();
-
-        foreach (var expired in _decks.Where(d => now - d.Value.LastUsed > IdleExpiry).Select(d => d.Key).ToList())
+        lock (_registryGate)
         {
-            _decks.Remove(expired);
+            var now = _time.GetUtcNow();
+
+            foreach (var expired in _decks.Where(d => now - d.Value.LastUsed > IdleExpiry).Select(d => d.Key).ToList())
+            {
+                _decks.Remove(expired);
+            }
+
+            if (key.Length > 0 && _decks.TryGetValue(key, out var entry))
+            {
+                entry.LastUsed = now;
+                return entry;
+            }
+
+            if (key.Length == 0 || !MayCreateDeck(now))
+            {
+                _shared.LastUsed = now;
+                return _shared;
+            }
+
+            entry = new DeckEntry(new ShuffleDeck(new Random()), now);
+            _decks[key] = entry;
+            _lastDeckCreated = now;
+            return entry;
+        }
+    }
+
+    // Caller holds _registryGate. Evicts the least recently used deck when that makes room.
+    private bool MayCreateDeck(DateTimeOffset now)
+    {
+        if (_decks.Count >= RateLimitedAbove && now - _lastDeckCreated < NewDeckInterval)
+        {
+            return false;
         }
 
-        if (_decks.TryGetValue(key, out var entry))
+        if (_decks.Count < MaxDecks)
         {
-            entry.LastUsed = now;
-            return entry.Deck;
+            return true;
         }
 
-        while (_decks.Count >= MaxDecks)
+        var leastRecent = _decks.MinBy(d => d.Value.LastUsed);
+        if (now - leastRecent.Value.LastUsed < ProtectedFor)
         {
-            var leastRecent = _decks.MinBy(d => d.Value.LastUsed).Key;
-            _decks.Remove(leastRecent);
+            return false;
         }
 
-        entry = new DeckEntry(new ShuffleDeck(new Random()), now);
-        _decks[key] = entry;
-        return entry.Deck;
+        _decks.Remove(leastRecent.Key);
+        return true;
     }
 }

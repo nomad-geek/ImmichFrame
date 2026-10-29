@@ -38,10 +38,10 @@ public class ShuffleModeTests
     public async Task ApplyShuffleMode_Exhaustive_DealsFromTheSourceIds()
     {
         var ids = Enumerable.Range(0, 3).Select(_ => Guid.NewGuid()).ToList();
-        _source.Setup(s => s.GetAllAssetIds(It.IsAny<CancellationToken>())).ReturnsAsync((IReadOnlyList<Guid>)ids);
+        _source.Setup(s => s.GetAllAssetIds(It.IsAny<CancellationToken>())).ReturnsAsync(new AssetIdList(ids));
         _source.Setup(s => s.LoadAssetsByIds(It.IsAny<IReadOnlyList<Guid>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((IReadOnlyList<Guid> requested, CancellationToken _) =>
-                (IReadOnlyList<AssetResponseDto>)requested.Select(id => new AssetResponseDto { Id = id, Type = AssetTypeEnum.IMAGE }).ToList());
+                AssetLoadResult.Of(requested.Select(id => new AssetResponseDto { Id = id, Type = AssetTypeEnum.IMAGE }).ToList()));
 
         var pool = PooledImmichFrameLogic.ApplyShuffleMode(_source.Object, ShuffleMode.Exhaustive);
         var assets = (await pool.GetAssets(3, "frame-1")).ToList();

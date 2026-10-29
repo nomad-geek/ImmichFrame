@@ -13,7 +13,7 @@ public class TotalAccountImagesSelectionStrategy(
     // The batch size of the account that holds the most assets; the others are asked for their share of it.
     public const int BatchSize = 25;
 
-    public async Task<(IAccountImmichFrameLogic, AssetResponseDto)?> GetNextAsset(string clientId = "")
+    public async Task<(IAccountImmichFrameLogic, AssetResponseDto)?> GetNextAsset(string clientId = "", CancellationToken ct = default)
     {
         if (_accounts.Count == 0)
         {
@@ -23,7 +23,7 @@ public class TotalAccountImagesSelectionStrategy(
 
         var chosen = await _accounts.ChooseOne(logic => logic.GetTotalAssets());
 
-        var asset = await chosen.GetNextAsset(clientId);
+        var asset = await chosen.GetNextAsset(clientId, ct);
         if (asset != null)
         {
             await _tracker.RecordAssetLocation(chosen, asset.Id);
@@ -58,7 +58,7 @@ public class TotalAccountImagesSelectionStrategy(
         return account.GetTotalAssets();
     }
 
-    public async Task<IEnumerable<(IAccountImmichFrameLogic, AssetResponseDto)>> GetAssets(string clientId = "")
+    public async Task<IEnumerable<(IAccountImmichFrameLogic, AssetResponseDto)>> GetAssets(string clientId = "", CancellationToken ct = default)
     {
         if (_accounts.Count == 0)
         {
@@ -82,7 +82,7 @@ public class TotalAccountImagesSelectionStrategy(
                     return (account, assets: (IEnumerable<AssetResponseDto>)[]);
                 }
 
-                var assets = (await account.GetAssets(count, clientId)).ToList();
+                var assets = (await account.GetAssets(count, clientId, ct)).ToList();
                 _logger.LogDebug("Retrieved {total} asset(s) for account [{account}], asked for {count}", assets.Count, account, count);
                 return (account, assets: (IEnumerable<AssetResponseDto>)assets);
             });

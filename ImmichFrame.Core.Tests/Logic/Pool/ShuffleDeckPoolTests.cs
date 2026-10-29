@@ -25,30 +25,64 @@ public class ShuffleDeckPoolTests
         // Optional extra filter per call: returns the IDs of this request to leave out.
         public Func<int, IReadOnlyList<Guid>, IEnumerable<Guid>>? LeaveOut { get; set; }
 
+        // IDs that LoadAssetsByIds reports as worth retrying, as if the server failed for a moment.
+        public Func<int, IReadOnlyList<Guid>, IEnumerable<Guid>>? Retry { get; set; }
+
+        // Throws from LoadAssetsByIds on the given call, as if the request was cancelled.
+        public int? CancelOnCall { get; set; }
+
         public int GetAllAssetIdsCalls => Volatile.Read(ref _getAllAssetIdsCalls);
         public int LoadAssetsByIdsCalls => Volatile.Read(ref _loadAssetsByIdsCalls);
         public List<IReadOnlyList<Guid>> LoadRequests { get; } = [];
+        public List<CancellationToken> Tokens { get; } = [];
+
+        private List<Guid>? _listedIds;
+        private AssetIdList? _listing;
 
         public Task<long> GetAssetCount(CancellationToken ct = default) => Task.FromResult((long)Ids.Count);
 
         public Task<IEnumerable<AssetResponseDto>> GetAssets(int requested, string clientId = "", CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public Task<IReadOnlyList<Guid>> GetAllAssetIds(CancellationToken ct = default)
+        // One listing per Ids instance, as a cached source would hand out.
+        public AssetIdList Listing
         {
-            Interlocked.Increment(ref _getAllAssetIdsCalls);
-            return Task.FromResult<IReadOnlyList<Guid>>(Ids);
+            get
+            {
+                lock (LoadRequests)
+                {
+                    if (!ReferenceEquals(_listedIds, Ids))
+                    {
+                        _listedIds = Ids;
+                        _listing = new AssetIdList(Ids);
+                    }
+
+                    return _listing!;
+                }
+            }
         }
 
-        public async Task<IReadOnlyList<AssetResponseDto>> LoadAssetsByIds(IReadOnlyList<Guid> ids, CancellationToken ct = default)
+        public Task<AssetIdList> GetAllAssetIds(CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref _getAllAssetIdsCalls);
+            return Task.FromResult(Listing);
+        }
+
+        public async Task<AssetLoadResult> LoadAssetsByIds(IReadOnlyList<Guid> ids, CancellationToken ct = default)
         {
             var call = Interlocked.Increment(ref _loadAssetsByIdsCalls) - 1;
             lock (LoadRequests)
             {
                 LoadRequests.Add(ids.ToList());
+                Tokens.Add(ct);
             }
 
             await Task.Yield();
+
+            if (call == CancelOnCall)
+            {
+                throw new OperationCanceledException();
+            }
 
             var leaveOut = new HashSet<Guid>(LeftOut);
             if (LeaveOut != null)
@@ -56,7 +90,10 @@ public class ShuffleDeckPoolTests
                 leaveOut.UnionWith(LeaveOut(call, ids));
             }
 
-            return ids.Where(id => !leaveOut.Contains(id)).Select(id => new AssetResponseDto { Id = id }).ToList();
+            var retry = Retry?.Invoke(call, ids).ToHashSet() ?? [];
+            var loaded = ids.Where(id => !leaveOut.Contains(id) && !retry.Contains(id))
+                .Select(id => new AssetResponseDto { Id = id }).ToList();
+            return new AssetLoadResult(loaded, ids.Where(retry.Contains).ToList());
         }
     }
 
@@ -143,7 +180,8 @@ public class ShuffleDeckPoolTests
         dealt.AddRange(await Draw(5, null!));
         dealt.AddRange(await Draw(5, "\t"));
 
-        Assert.That(_pool.DeckCount, Is.EqualTo(1));
+        // They deal from the shared deck, which is not a client deck.
+        Assert.That(_pool.DeckCount, Is.EqualTo(0));
         Assert.That(dealt, Is.EquivalentTo(ids));
     }
 
@@ -346,5 +384,129 @@ public class ShuffleDeckPoolTests
         }
 
         Assert.That(_pool.DeckCount, Is.EqualTo(2));
+    }
+
+    [Test]
+    public async Task GetAssets_ClientDecks_ShareOneListing()
+    {
+        _source.Ids = Ids(50);
+
+        await Draw(5, "a");
+        await Draw(5, "b");
+
+        // The member set is held once, by the listing, not copied into each deck.
+        Assert.That(_pool.ListingOf("a"), Is.SameAs(_source.Listing));
+        Assert.That(_pool.ListingOf("b"), Is.SameAs(_source.Listing));
+    }
+
+    [Test]
+    public async Task GetAssets_PastRateLimit_NewClientsShareDeckUntilIntervalPasses()
+    {
+        var ids = Ids(20);
+        _source.Ids = ids;
+
+        for (var i = 0; i < ShuffleDeckPool.RateLimitedAbove; i++)
+        {
+            await Draw(5, $"c{i}");
+        }
+
+        Assert.That(_pool.DeckCount, Is.EqualTo(ShuffleDeckPool.RateLimitedAbove));
+
+        // Within the interval, new clients get no deck of their own; they share one.
+        var shared = new List<Guid>();
+        shared.AddRange(await Draw(5, "x"));
+        shared.AddRange(await Draw(5, "y"));
+        _time.Now += ShuffleDeckPool.NewDeckInterval - TimeSpan.FromSeconds(1);
+        shared.AddRange(await Draw(5, "z"));
+        Assert.That(_pool.DeckCount, Is.EqualTo(ShuffleDeckPool.RateLimitedAbove));
+        Assert.That(_pool.ListingOf("x"), Is.Null);
+        Assert.That(shared, Is.Unique, "the shared deck deals one cycle across those clients");
+
+        _time.Now += TimeSpan.FromSeconds(1);
+        await Draw(5, "x");
+        Assert.That(_pool.DeckCount, Is.EqualTo(ShuffleDeckPool.RateLimitedAbove + 1));
+        Assert.That(_pool.ListingOf("x"), Is.Not.Null);
+
+        // Only one new deck per interval.
+        await Draw(5, "y");
+        Assert.That(_pool.ListingOf("y"), Is.Null);
+    }
+
+    [Test]
+    public async Task GetAssets_AtCapWithAllDecksRecentlyUsed_EvictsNone()
+    {
+        var ids = Ids(40);
+        _source.Ids = ids;
+
+        for (var i = 0; i < ShuffleDeckPool.MaxDecks; i++)
+        {
+            _time.Now += ShuffleDeckPool.NewDeckInterval;
+            await Draw(5, $"c{i}");
+        }
+
+        // Every deck has been used within the protected window.
+        _time.Now += ShuffleDeckPool.NewDeckInterval;
+        await Draw(5, "c0");
+        _time.Now += TimeSpan.FromSeconds(1);
+        for (var i = 1; i < ShuffleDeckPool.MaxDecks; i++)
+        {
+            await Draw(5, $"c{i}");
+        }
+
+        // c0, the least recently used, was used 9:59 ago.
+        _time.Now += ShuffleDeckPool.ProtectedFor - TimeSpan.FromSeconds(2);
+        await Draw(5, "newcomer");
+        Assert.That(_pool.DeckCount, Is.EqualTo(ShuffleDeckPool.MaxDecks));
+        Assert.That(_pool.ListingOf("newcomer"), Is.Null, "the newcomer is sent to the shared deck");
+        Assert.That(_pool.ListingOf("c0"), Is.Not.Null);
+
+        // Once the least recently used deck is past the window, it makes room.
+        _time.Now += TimeSpan.FromSeconds(1);
+        await Draw(5, "newcomer");
+        Assert.That(_pool.DeckCount, Is.EqualTo(ShuffleDeckPool.MaxDecks));
+        Assert.That(_pool.ListingOf("newcomer"), Is.Not.Null);
+        Assert.That(_pool.ListingOf("c0"), Is.Null, "c0 was the least recently used");
+        Assert.That(_pool.ListingOf("c1"), Is.Not.Null);
+    }
+
+    [Test]
+    public async Task GetAssets_RetryIds_GoBackToDeckAndAreDealtLaterInCycle()
+    {
+        var ids = Ids(20);
+        _source.Ids = ids;
+        _source.Retry = (call, requested) => call == 0 ? requested.Take(2) : [];
+
+        var first = (await _pool.GetAssets(5, "a")).Select(a => a.Id).ToList();
+        var retried = _source.LoadRequests[0].Take(2).ToList();
+        Assert.That(first, Has.Count.EqualTo(5));
+        Assert.That(first, Does.Not.Contain(retried[0]).And.Not.Contain(retried[1]));
+
+        // Without returning them, they would be skipped until the next cycle.
+        var rest = await Draw(5, "a", calls: 3);
+        Assert.That(first.Concat(rest), Is.EquivalentTo(ids));
+    }
+
+    [Test]
+    public async Task GetAssets_CancelledWhileLoading_DealtIdsGoBackToDeck()
+    {
+        var ids = Ids(20);
+        _source.Ids = ids;
+        _source.CancelOnCall = 0;
+
+        Assert.That(async () => await _pool.GetAssets(5, "a"), Throws.InstanceOf<OperationCanceledException>());
+
+        var all = await Draw(5, "a", calls: 4);
+        Assert.That(all, Is.EquivalentTo(ids));
+    }
+
+    [Test]
+    public async Task GetAssets_PassesCallerTokenToSource()
+    {
+        _source.Ids = Ids(20);
+        using var cts = new CancellationTokenSource();
+
+        await _pool.GetAssets(5, "a", cts.Token);
+
+        Assert.That(_source.Tokens, Is.All.EqualTo(cts.Token));
     }
 }

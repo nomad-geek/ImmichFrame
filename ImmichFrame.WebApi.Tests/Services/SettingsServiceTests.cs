@@ -113,7 +113,7 @@ namespace ImmichFrame.WebApi.Tests.Services
 
             Assert.Multiple(() =>
             {
-                Assert.That(json, Does.Contain("\"ShuffleMode\":\"Exhaustive\""));
+                Assert.That(json, Does.Contain("\"ShuffleMode\":\"exhaustive\""));
                 Assert.That(restored.AccountsImpl.Single().ShuffleMode, Is.EqualTo(ShuffleMode.Exhaustive));
             });
         }
@@ -127,6 +127,59 @@ namespace ImmichFrame.WebApi.Tests.Services
             var restored = System.Text.Json.JsonSerializer.Deserialize<ServerSettings>(json)!;
 
             Assert.That(restored.AccountsImpl.Single().ShuffleMode, Is.EqualTo(ShuffleMode.Exhaustive));
+        }
+
+        [TestCase("\"Sometimes\"")]
+        [TestCase("1")]
+        public async Task InitializeAsync_UnreadableShuffleMode_NotImportedAndSetupStaysClosed(string shuffleModeJson)
+        {
+            WriteSettingsJson($$"""
+                {
+                    "General": { "Interval": 10 },
+                    "Accounts": [ { "ImmichServerUrl": "http://immich.local", "ApiKey": "key123", "ShuffleMode": {{shuffleModeJson}} } ]
+                }
+                """);
+
+            var service = CreateService();
+            await service.InitializeAsync();
+            var adminAuth = new AdminAuthService(service);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(service.IsUnconfigured, Is.False);
+                Assert.That(service.Current.Accounts, Is.Empty);
+                Assert.That(service.Current.GeneralSettings.Interval, Is.EqualTo(new GeneralSettings().Interval));
+                if (Environment.GetEnvironmentVariable(AdminAuthService.AdminPasswordEnvVar) == null)
+                {
+                    Assert.That(adminAuth.SetupRequired, Is.False);
+                }
+            });
+
+            var options = new DbContextOptionsBuilder<SettingsDbContext>()
+                .UseSqlite($"Data Source={Path.Combine(_configDir, "immichframe.db")}")
+                .Options;
+            await using var db = new SettingsDbContext(options);
+            Assert.That(await db.SettingsDocuments.CountAsync(), Is.EqualTo(0));
+        }
+
+        [TestCase(null, ShuffleMode.Exhaustive, true)]
+        [TestCase("", ShuffleMode.Exhaustive, true)]
+        [TestCase("secret", ShuffleMode.Exhaustive, false)]
+        [TestCase(null, ShuffleMode.Random, false)]
+        [TestCase("secret", ShuffleMode.Random, false)]
+        public void ExhaustiveWithoutSecret_OnlyWhenExhaustiveAndNoSecret(string? secret, ShuffleMode mode, bool expected)
+        {
+            var settings = new ServerSettings
+            {
+                GeneralSettingsImpl = new GeneralSettings { AuthenticationSecret = secret },
+                AccountsImpl = new List<ServerAccountSettings>
+                {
+                    new() { ShuffleMode = ShuffleMode.Random },
+                    new() { ShuffleMode = mode }
+                }
+            };
+
+            Assert.That(SettingsService.ExhaustiveWithoutSecret(settings), Is.EqualTo(expected));
         }
 
         [Test]

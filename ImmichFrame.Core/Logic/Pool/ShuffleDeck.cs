@@ -2,14 +2,19 @@ namespace ImmichFrame.Core.Logic.Pool;
 
 /// <summary>
 /// A shuffled deck of asset IDs: every member is dealt once per cycle before any is dealt again.
-/// Members can be added or removed mid-cycle without restarting it. Not thread-safe; the owner locks.
+/// Members can be added or removed mid-cycle without restarting it. The member set belongs to the
+/// shared <see cref="AssetIdList"/>; the deck keeps only its own undealt order. Not thread-safe;
+/// the owner locks.
 /// </summary>
 public sealed class ShuffleDeck(Random random)
 {
     /// <summary>How many of the most recently dealt cards are kept out of the start of the next cycle.</summary>
     public const int RecentWindow = 25;
 
-    private HashSet<Guid> _members = [];
+    private static readonly AssetIdList NoMembers = new([]);
+
+    private AssetIdList _list = NoMembers;
+    private bool _synced;
 
     // The rest of the current cycle, dealt from the end.
     private readonly List<Guid> _undealt = [];
@@ -18,50 +23,61 @@ public sealed class ShuffleDeck(Random random)
     private readonly List<Guid> _recent = [];
     private int _recentCapacity = RecentWindow;
 
-    /// <summary>The ID list instance this deck was last synced with.</summary>
-    public object? SyncedSource { get; set; }
+    /// <summary>The version of the listing this deck was last synced with, or -1 before the first sync.</summary>
+    public long Version => _synced ? _list.Version : -1;
 
-    public int Count => _members.Count;
+    public int Count => _list.Count;
 
-    public void Sync(IReadOnlyCollection<Guid> ids)
+    /// <summary>The listing this deck deals from, shared with every other deck synced to it.</summary>
+    internal AssetIdList Listing => _list;
+
+    /// <summary>Syncs with a fresh listing of these IDs.</summary>
+    public void Sync(IReadOnlyCollection<Guid> ids) => Sync(new AssetIdList(ids));
+
+    /// <summary>
+    /// Moves the deck to this listing. A listing older than (or the same as) the one already
+    /// synced is ignored, so a slow request can never take the deck back. Returns whether it synced.
+    /// </summary>
+    public bool Sync(AssetIdList list)
     {
-        var next = new HashSet<Guid>(ids);
-
-        if (_members.Count > 0)
+        if (_synced && list.Version <= _list.Version)
         {
-            var removed = new HashSet<Guid>(_members);
-            removed.ExceptWith(next);
-            if (removed.Count > 0)
-            {
-                _undealt.RemoveAll(removed.Contains);
-                _recent.RemoveAll(removed.Contains);
-            }
+            return false;
         }
+
+        var previous = _list;
+        var members = list.Members;
+        _undealt.RemoveAll(id => !members.Contains(id));
+        _recent.RemoveAll(id => !members.Contains(id));
 
         // Newcomers join the rest of the current cycle at a uniformly random position. With nothing
         // left in the cycle (including the first sync) they wait for the next one, which shuffles
         // every member.
-        var cycleInProgress = _undealt.Count > 0;
-        foreach (var id in ids)
+        if (_undealt.Count > 0)
         {
-            if (_members.Add(id) && cycleInProgress)
+            foreach (var id in list.Ids)
             {
-                _undealt.Insert(random.Next(_undealt.Count + 1), id);
+                if (!previous.Members.Contains(id))
+                {
+                    _undealt.Insert(random.Next(_undealt.Count + 1), id);
+                }
             }
         }
 
-        _members = next;
+        _list = list;
+        _synced = true;
+        return true;
     }
 
     public IReadOnlyList<Guid> Deal(int n)
     {
-        if (n <= 0 || _members.Count == 0)
+        if (n <= 0 || _list.Count == 0)
         {
             return [];
         }
 
         // A batch never holds the same card twice.
-        n = Math.Min(n, _members.Count);
+        n = Math.Min(n, _list.Count);
         _recentCapacity = Math.Max(_recentCapacity, n);
 
         var dealt = new List<Guid>(n);
@@ -81,6 +97,21 @@ public sealed class ShuffleDeck(Random random)
         return dealt;
     }
 
+    /// <summary>
+    /// Puts dealt cards that were never shown back into the rest of the cycle, at random positions,
+    /// so they are dealt again later. Cards no longer in the listing are dropped.
+    /// </summary>
+    public void Return(IEnumerable<Guid> cards)
+    {
+        foreach (var card in cards)
+        {
+            if (_list.Members.Contains(card) && !_undealt.Contains(card))
+            {
+                _undealt.Insert(random.Next(_undealt.Count + 1), card);
+            }
+        }
+    }
+
     private void Remember(Guid card)
     {
         _recent.Add(card);
@@ -94,7 +125,8 @@ public sealed class ShuffleDeck(Random random)
     // spans the join never repeats a card and the end of one cycle doesn't reappear at the start of the next.
     private void Refill(int need, int inBatch)
     {
-        var n = _members.Count;
+        var members = _list.Members;
+        var n = _list.Count;
         var avoidCount = Math.Min(Math.Max(inBatch, Math.Min(RecentWindow, n / 2)), n - need);
 
         var avoid = new List<Guid>(avoidCount);
@@ -102,13 +134,13 @@ public sealed class ShuffleDeck(Random random)
         for (var i = _recent.Count - 1; i >= 0 && avoid.Count < avoidCount; i--)
         {
             var card = _recent[i];
-            if (_members.Contains(card) && avoidSet.Add(card))
+            if (members.Contains(card) && avoidSet.Add(card))
             {
                 avoid.Add(card);
             }
         }
 
-        var order = _members.Where(id => !avoidSet.Contains(id)).ToList();
+        var order = _list.Ids.Where(id => !avoidSet.Contains(id)).ToList();
         Shuffle(order);
         var guard = Math.Min(order.Count, Math.Max(RecentWindow, need));
 

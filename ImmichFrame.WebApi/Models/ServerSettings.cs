@@ -95,10 +95,18 @@ public class ServerAccountSettings : IAccountSettings
     public List<Guid> People { get; set; } = new();
     public List<string> Tags { get; set; } = new();
     public int? Rating { get; set; }
+    // On the property too: the API's global enum converter would otherwise win over the type's own
+    // and accept numbers.
+    [JsonConverter(typeof(StrictEnumJsonConverter<ShuffleMode>))]
     public ShuffleMode ShuffleMode { get; set; } = ShuffleMode.Random;
 
     public void ValidateAndInitialize()
     {
+        if (!Enum.IsDefined(ShuffleMode))
+        {
+            throw new InvalidOperationException($"ShuffleMode must be one of: {string.Join(", ", Enum.GetNames<ShuffleMode>())}.");
+        }
+
         if (!string.IsNullOrWhiteSpace(ApiKeyFile))
         {
             if (!string.IsNullOrWhiteSpace(ApiKey))

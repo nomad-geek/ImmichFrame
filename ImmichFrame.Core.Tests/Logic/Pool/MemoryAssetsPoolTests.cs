@@ -241,7 +241,7 @@ public class MemoryAssetsPoolTests
         var second = await _memoryAssetsPool.GetAllAssetIds();
 
         Assert.That(second, Is.SameAs(first));
-        Assert.That(first, Is.EquivalentTo(memories.SelectMany(m => m.Assets).Select(a => a.Id)));
+        Assert.That(first.Ids, Is.EquivalentTo(memories.SelectMany(m => m.Assets).Select(a => a.Id)));
         _mockImmichApi.Verify(x => x.SearchMemoriesAsync(It.IsAny<DateTimeOffset>(), null, null, null, null, null, null, null, null, It.IsAny<CancellationToken>()), Times.Once);
     }
 
@@ -256,7 +256,8 @@ public class MemoryAssetsPoolTests
 
         var loaded = await _memoryAssetsPool.LoadAssetsByIds(new List<Guid> { assets[2].Id, unknown, assets[0].Id });
 
-        Assert.That(loaded.Select(a => a.Id), Is.EqualTo(new[] { assets[2].Id, assets[0].Id }));
+        Assert.That(loaded.Loaded.Select(a => a.Id), Is.EqualTo(new[] { assets[2].Id, assets[0].Id }));
+        Assert.That(loaded.Retry, Is.Empty);
         _mockImmichApi.Verify(x => x.GetAssetInfoAsync(It.IsAny<Guid>(), null, null, It.IsAny<CancellationToken>()), Times.Never);
     }
 }

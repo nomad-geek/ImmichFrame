@@ -192,9 +192,15 @@ Accounts:
       - UUID
 ```
 
-- Each frame keeps its own shuffled order and its own place in the cycle. Up to 32 frames are tracked per account; a frame that has not asked for photos for 24 hours starts a new cycle.
-- New photos join the current cycle when the list is refreshed (every `RefreshAlbumPeopleInterval` hours), and deleted ones drop out; the cycle is not restarted. With `RefreshAlbumPeopleInterval: 0` the list is fetched again on every request, which costs one Immich request per 1000 photos, so keep the interval above 0 for a large library.
+- Each frame keeps its own shuffled order and its own place in the cycle. Up to 32 frames are tracked per account; a frame that has not asked for photos for 24 hours starts a new cycle. Past 8 frames, a new frame gets its own order at most once a minute, and a frame that has asked for photos in the last 10 minutes is never dropped to make room; frames turned away share one common order instead.
+- New photos join the current cycle when the list of photos is refreshed (every `RefreshAlbumPeopleInterval` hours), and deleted ones drop out; the cycle is not restarted. In Exhaustive mode the list is kept for **at least 5 minutes**, even with `RefreshAlbumPeopleInterval: 0`, because fetching it costs one Immich request per 1000 photos. `RefreshAlbumPeopleInterval` keeps its meaning for everything else.
+- A photo is checked against the account's settings when it is dealt, so a photo removed from the album, unfavorited, archived or retagged since the last refresh is skipped rather than shown.
 - Changing an account's settings, or restarting ImmichFrame, starts a new cycle on every frame.
+- `ShuffleMode` accepts only `Random` or `Exhaustive`; any other value (including a number) is a configuration error.
+
+:::tip
+Set an `AuthenticationSecret` (see [Security](#security)) when you use `Exhaustive`. ImmichFrame keeps an order for each frame that asks, and fetches the photo list from Immich, so on an open port anyone who can reach ImmichFrame can make it do that work. ImmichFrame logs a warning at startup when `Exhaustive` is on without a secret.
+:::
 
 ### Weather
 

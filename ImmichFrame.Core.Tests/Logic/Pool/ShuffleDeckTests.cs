@@ -323,4 +323,57 @@ public class ShuffleDeckTests
         deck.Sync(Ids(3));
         Assert.That(deck.Count, Is.EqualTo(3));
     }
+
+    [Test]
+    public void Sync_OlderListing_IsIgnored()
+    {
+        var older = new AssetIdList(Ids(10, "old"));
+        var newer = new AssetIdList(Ids(10, "new"));
+        var deck = new ShuffleDeck(new Random(1));
+
+        Assert.That(deck.Sync(newer), Is.True);
+        // A slow request that started before the refresh must not take the deck back.
+        Assert.That(deck.Sync(older), Is.False);
+        Assert.That(deck.Sync(newer), Is.False, "the same listing is not synced twice");
+        Assert.That(deck.Version, Is.EqualTo(newer.Version));
+        Assert.That(deck.Deal(10), Is.EquivalentTo(newer.Ids));
+    }
+
+    [Test]
+    public void Version_BeforeFirstSync_IsMinusOne()
+    {
+        Assert.That(new ShuffleDeck(new Random(1)).Version, Is.EqualTo(-1));
+    }
+
+    [Test]
+    public void Return_PutsUnshownCardsBackIntoCycle()
+    {
+        var ids = Ids(20);
+        foreach (var seed in Seeds)
+        {
+            var deck = NewDeck(seed, ids);
+            var first = deck.Deal(5);
+            deck.Return(first.Take(2));
+
+            var rest = DealSingles(deck, 17);
+            Assert.That(first.Skip(2).Concat(rest), Is.EquivalentTo(ids), $"seed {seed}");
+        }
+    }
+
+    [Test]
+    public void Return_IgnoresNonMembersAndCardsStillUndealt()
+    {
+        var ids = Ids(10);
+        var deck = NewDeck(3, ids);
+        var first = deck.Deal(3);
+
+        deck.Return([FixtureHelpers.GuidFor("stranger"), first[0], first[0]]);
+        var undealt = deck.Deal(1).Concat(DealSingles(deck, 7)).ToList();
+        deck.Return([undealt[0]]);
+        deck.Return([undealt[0]]);
+
+        Assert.That(undealt, Has.Count.EqualTo(8));
+        Assert.That(undealt, Is.EquivalentTo(ids.Except(first.Skip(1))));
+        Assert.That(DealSingles(deck, 1), Is.EqualTo(new[] { undealt[0] }));
+    }
 }

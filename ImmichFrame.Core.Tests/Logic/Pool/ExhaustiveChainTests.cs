@@ -23,6 +23,7 @@ public class ExhaustiveChainTests
     private ApiCache _cache;
     private List<Guid> _libraryIds;
     private List<Guid> _memoryIds;
+    private int _listings;
 
     [SetUp]
     public void Setup()
@@ -33,7 +34,17 @@ public class ExhaustiveChainTests
         _api.Setup(a => a.SearchAssetStatisticsAsync(It.IsAny<StatisticsSearchDto>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new SearchStatisticsResponseDto { Total = LibrarySize });
         _api.Setup(a => a.SearchAssetsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MetadataSearchDto>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(AccountSearchPoolTests.SearchPage(_libraryIds, null));
+            .ReturnsAsync((string key, string slug, MetadataSearchDto dto, CancellationToken ct) =>
+            {
+                // Without an ID filter it is the listing; with one, loading a dealt asset.
+                if (dto.Filter?.Id == null)
+                {
+                    Interlocked.Increment(ref _listings);
+                    return AccountSearchPoolTests.SearchPage(_libraryIds, null);
+                }
+
+                return AccountSearchPoolTests.SearchPage(new List<Guid> { dto.Filter.Id.Eq!.Value }, null);
+            });
         _api.Setup(a => a.GetAssetInfoAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((Guid id, string key, string slug, CancellationToken ct) => new AssetResponseDto
             {
@@ -113,7 +124,7 @@ public class ExhaustiveChainTests
         });
 
         // The library is listed once through the metadata search and never picked at random.
-        _api.Verify(a => a.SearchAssetsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MetadataSearchDto>(), It.IsAny<CancellationToken>()), Times.Once);
+        Assert.That(_listings, Is.EqualTo(1));
         _api.Verify(a => a.SearchRandomAsync(It.IsAny<RandomSearchDto>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 }

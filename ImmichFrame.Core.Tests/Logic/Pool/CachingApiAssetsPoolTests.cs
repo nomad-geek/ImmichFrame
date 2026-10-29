@@ -155,7 +155,7 @@ public class CachingApiAssetsPoolTests
         var second = await _testPool.GetAllAssetIds();
 
         Assert.That(second, Is.SameAs(first));
-        Assert.That(first, Is.EquivalentTo(firstLoad.Select(a => a.Id)));
+        Assert.That(first.Ids, Is.EquivalentTo(firstLoad.Select(a => a.Id)));
 
         // The cache expires and reloads with a different asset set.
         var added = new AssetResponseDto { Id = FixtureHelpers.GuidFor("6"), Type = AssetTypeEnum.IMAGE };
@@ -166,7 +166,8 @@ public class CachingApiAssetsPoolTests
         var reloaded = await _testPool.GetAllAssetIds();
 
         Assert.That(reloaded, Is.Not.SameAs(first));
-        Assert.That(reloaded, Is.EquivalentTo(secondLoad.Select(a => a.Id)));
+        Assert.That(reloaded.Version, Is.GreaterThan(first.Version));
+        Assert.That(reloaded.Ids, Is.EquivalentTo(secondLoad.Select(a => a.Id)));
         Assert.That(await _testPool.GetAllAssetIds(), Is.SameAs(reloaded));
     }
 
@@ -179,6 +180,7 @@ public class CachingApiAssetsPoolTests
 
         var loaded = await _testPool.LoadAssetsByIds(new List<Guid> { assets[3].Id, unknown, assets[0].Id });
 
-        Assert.That(loaded, Is.EqualTo(new[] { assets[3], assets[0] }));
+        Assert.That(loaded.Loaded, Is.EqualTo(new[] { assets[3], assets[0] }));
+        Assert.That(loaded.Retry, Is.Empty);
     }
 }
