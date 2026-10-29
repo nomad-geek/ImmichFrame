@@ -142,6 +142,9 @@ Accounts:
     ImagesUntilDate: "2020-01-02" # Date
     # Minimum rating in stars, allowed values from -1 to 5. Shows images with this rating or higher.
     Rating: null # int
+    # Random: each batch is an independent random pick, so photos can repeat.
+    # Exhaustive: every matching photo is shown once, in random order, before any repeats; each frame keeps its own order.
+    ShuffleMode: Random # Random | Exhaustive
     # UUID of album(s) - e.g. ['00000000-0000-0000-0000-000000000001']
     Albums: # string[]
       - UUID
@@ -175,6 +178,23 @@ For tags, use the full hierarchical path (the `value` field) as it appears in Im
 
 - `"Vacation"` - matches a top-level tag named "Vacation"
 - `"Travel/Europe"` - matches a tag "Europe" under parent "Travel"
+
+### Show every photo before repeating
+
+By default (`ShuffleMode: Random`) every batch is an independent random pick, so a photo can come back soon while others are not shown for a long time. Set `ShuffleMode: Exhaustive` on an account to show every photo its settings select (albums, people, tags, favorites, the whole library, memories) once, in random order, before any photo repeats:
+
+```yaml
+Accounts:
+  - ImmichServerUrl: "http://immich:2283"
+    ApiKey: "super-secret-api-key"
+    ShuffleMode: Exhaustive
+    Albums:
+      - UUID
+```
+
+- Each frame keeps its own shuffled order and its own place in the cycle. Up to 32 frames are tracked per account; a frame that has not asked for photos for 24 hours starts a new cycle.
+- New photos join the current cycle when the list is refreshed (every `RefreshAlbumPeopleInterval` hours), and deleted ones drop out; the cycle is not restarted. With `RefreshAlbumPeopleInterval: 0` the list is fetched again on every request, which costs one Immich request per 1000 photos, so keep the interval above 0 for a large library.
+- Changing an account's settings, or restarting ImmichFrame, starts a new cycle on every frame.
 
 ### Weather
 
