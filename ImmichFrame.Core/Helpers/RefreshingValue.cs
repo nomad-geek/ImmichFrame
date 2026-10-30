@@ -8,11 +8,18 @@ namespace ImmichFrame.Core.Helpers;
 /// value is older than its lifetime, callers keep getting it while a single refresh runs in the
 /// background. A caller's cancellation ends only its own wait, never the shared load.
 /// After a failed load the next attempt waits, starting at <see cref="InitialBackoff"/> and
-/// doubling up to the lifetime; until then a caller without a value gets the last failure.
+/// doubling up to the smaller of the lifetime and <see cref="MaxBackoff"/> (<see cref="MaxBackoffWithoutValue"/>
+/// while no value has loaded yet); until then a caller without a value gets the last failure.
 /// </summary>
 public sealed class RefreshingValue<T> : IDisposable
 {
     public static readonly TimeSpan InitialBackoff = TimeSpan.FromSeconds(30);
+
+    /// <summary>The longest wait between attempts, so a value comes back soon after its source does.</summary>
+    public static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(15);
+
+    /// <summary>The longest wait between attempts while there is no value to serve meanwhile.</summary>
+    public static readonly TimeSpan MaxBackoffWithoutValue = TimeSpan.FromMinutes(5);
 
     private readonly Func<CancellationToken, Task<T>> _load;
     private readonly TimeSpan _lifetime;
@@ -145,16 +152,22 @@ public sealed class RefreshingValue<T> : IDisposable
         }
     }
 
-    // InitialBackoff doubled for each failure in a row, never longer than the lifetime.
+    // InitialBackoff doubled for each failure in a row, capped as described on the class. Caller holds _gate.
     private TimeSpan Backoff(int failures)
     {
+        var cap = _hasValue ? MaxBackoff : MaxBackoffWithoutValue;
+        if (_lifetime < cap)
+        {
+            cap = _lifetime;
+        }
+
         var delay = InitialBackoff;
-        for (var i = 1; i < failures && delay < _lifetime && delay < TimeSpan.MaxValue / 2; i++)
+        for (var i = 1; i < failures && delay < cap; i++)
         {
             delay *= 2;
         }
 
-        return delay < _lifetime ? delay : _lifetime;
+        return delay < cap ? delay : cap;
     }
 
     // Cancels a load still running. The token source is not disposed, since that load may still hold its token.

@@ -493,12 +493,27 @@ public class ShuffleDeckPoolTests
 
         var first = (await _pool.GetAssets(5, "a")).Select(a => a.Id).ToList();
         var retried = _source.LoadRequests[0].Take(2).ToList();
-        Assert.That(first, Has.Count.EqualTo(5));
+        Assert.That(first, Has.Count.EqualTo(3));
         Assert.That(first, Does.Not.Contain(retried[0]).And.Not.Contain(retried[1]));
 
         // Without returning them, they would be skipped until the next cycle.
-        var rest = await Draw(5, "a", calls: 3);
+        var rest = await Draw(17, "a");
         Assert.That(first.Concat(rest), Is.EquivalentTo(ids));
+    }
+
+    [Test]
+    public async Task GetAssets_RoundWithPassingFailure_DealsNoFurtherRounds()
+    {
+        var ids = Ids(100);
+        _source.Ids = ids;
+        // Immich is down: every load fails for a passing reason.
+        _source.Retry = (_, requested) => requested;
+
+        var assets = await _pool.GetAssets(5, "a");
+
+        Assert.That(assets, Is.Empty);
+        Assert.That(_source.LoadAssetsByIdsCalls, Is.EqualTo(1));
+        Assert.That(_source.LoadRequests[0], Has.Count.EqualTo(5));
     }
 
     [Test]

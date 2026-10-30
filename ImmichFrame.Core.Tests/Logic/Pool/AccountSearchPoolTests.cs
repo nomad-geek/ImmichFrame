@@ -497,7 +497,7 @@ public class AccountSearchPoolTests
     }
 
     [Test]
-    public async Task LoadAssetsByIds_OtherErrors_AreLoggedByIdAndRetried()
+    public async Task LoadAssetsByIds_OtherErrors_AreRetriedAndLoggedOncePerBatch()
     {
         var kept = FixtureHelpers.GuidFor("kept");
         var serverError = FixtureHelpers.GuidFor("server-error");
@@ -513,12 +513,11 @@ public class AccountSearchPoolTests
 
         Assert.That(result.Loaded.Select(a => a.Id), Is.EqualTo(new[] { kept }));
         Assert.That(result.Retry, Is.EqualTo(new[] { serverError, networkError }));
-        foreach (var id in new[] { serverError, networkError })
-        {
-            logger.Verify(l => l.Log(Microsoft.Extensions.Logging.LogLevel.Warning, It.IsAny<EventId>(),
-                It.Is<It.IsAnyType>((state, _) => state.ToString()!.Contains(id.ToString())),
-                It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()), Times.Once);
-        }
+        logger.Verify(l => l.Log(Microsoft.Extensions.Logging.LogLevel.Warning, It.IsAny<EventId>(),
+            It.Is<It.IsAnyType>((state, _) => state.ToString()!.Contains("Could not load 2 of 3 assets")),
+            It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()), Times.Once);
+        logger.Verify(l => l.Log(Microsoft.Extensions.Logging.LogLevel.Warning, It.IsAny<EventId>(),
+            It.IsAny<It.IsAnyType>(), It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()), Times.Once);
     }
 
     [Test]
@@ -678,23 +677,78 @@ public class AccountSearchPoolTests
 
     [TestCase(400)]
     [TestCase(403)]
-    public async Task LoadAssetsByIds_EveryLoadRejected_ReturnsIdsToDeckAndWarns(int status)
+    public async Task LoadAssetsByIds_RefusedRunAcrossOneAssetCalls_WarnsAndKeepsAssets(int status)
     {
-        var ids = Ids("rejected", 5);
+        var ids = Ids("refused", AccountSearchPool.RefusalsBeforeWarning);
         SetupLoads(_ => throw ApiError(status));
+        var logger = new Mock<ILogger>();
+        using var pool = new AccountSearchPool(_cache.Object, _api.Object, _settings.Object, logger: logger.Object);
+
+        var results = new List<AssetLoadResult>();
+        foreach (var id in ids)
+        {
+            results.Add(await pool.LoadAssetsByIds(new List<Guid> { id }));
+        }
+
+        Assert.That(results.SelectMany(r => r.Loaded), Is.Empty);
+        // Until the run is long enough, each refused asset is taken to be gone and dropped.
+        Assert.That(results.SkipLast(1).SelectMany(r => r.Retry), Is.Empty);
+        Assert.That(results[^1].Retry, Is.EqualTo(new[] { ids[^1] }));
+        VerifyRefusalWarning(logger, Times.Once());
+    }
+
+    [Test]
+    public async Task LoadAssetsByIds_TwoDeletedAssets_AreDroppedWithoutWarning()
+    {
+        var ids = Ids("deleted", 2);
+        SetupLoads(_ => throw ApiError(400));
         var logger = new Mock<ILogger>();
         using var pool = new AccountSearchPool(_cache.Object, _api.Object, _settings.Object, logger: logger.Object);
 
         var result = await pool.LoadAssetsByIds(ids);
 
         Assert.That(result.Loaded, Is.Empty);
-        Assert.That(result.Retry, Is.EqualTo(ids));
-        logger.Verify(l => l.Log(Microsoft.Extensions.Logging.LogLevel.Warning, It.IsAny<EventId>(),
-            It.Is<It.IsAnyType>((state, _) => state.ToString()!.Contains("refused all 5")),
-            It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()), Times.Once);
-        logger.Verify(l => l.Log(Microsoft.Extensions.Logging.LogLevel.Debug, It.IsAny<EventId>(),
-            It.Is<It.IsAnyType>((state, _) => state.ToString()!.Contains(status.ToString())),
-            It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()), Times.Exactly(5));
+        Assert.That(result.Retry, Is.Empty);
+        VerifyRefusalWarning(logger, Times.Never());
+    }
+
+    [Test]
+    public async Task LoadAssetsByIds_SuccessfulLoad_EndsTheRefusalRun()
+    {
+        var refused = Ids("refused", AccountSearchPool.RefusalsBeforeWarning * 2 - 2);
+        var kept = FixtureHelpers.GuidFor("kept");
+        SetupLoads(id => id == kept ? Task.FromResult<AssetResponseDto?>(Asset(id)) : throw ApiError(403));
+        var logger = new Mock<ILogger>();
+        using var pool = new AccountSearchPool(_cache.Object, _api.Object, _settings.Object, logger: logger.Object);
+
+        var half = AccountSearchPool.RefusalsBeforeWarning - 1;
+        var calls = refused.Take(half).Append(kept).Concat(refused.Skip(half));
+        var retried = new List<Guid>();
+        foreach (var id in calls)
+        {
+            retried.AddRange((await pool.LoadAssetsByIds(new List<Guid> { id })).Retry);
+        }
+
+        Assert.That(retried, Is.Empty);
+        VerifyRefusalWarning(logger, Times.Never());
+    }
+
+    [Test]
+    public void GetAllAssetIds_CursorKeepsGoing_GivesUpPastThePageCap()
+    {
+        _api.Setup(a => a.SearchAssetStatisticsAsync(It.IsAny<StatisticsSearchDto>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SearchStatisticsResponseDto { Total = 2500 });
+        var pages = 0;
+        // Far more pages than 2500 assets fill; ends only so the test cannot hang.
+        SetupSearch((_, _) =>
+        {
+            var page = Interlocked.Increment(ref pages);
+            return Task.FromResult(SearchPage(Ids($"page{page}", 1), page < 50 ? $"cursor-{page}" : null));
+        });
+
+        Assert.That(async () => await _pool.GetAllAssetIds(), Throws.InstanceOf<InvalidOperationException>());
+        // 2500 assets need 3 pages; the cap allows 2 + 10.
+        Assert.That(pages, Is.EqualTo(12));
     }
 
     [Test]
@@ -747,6 +801,11 @@ public class AccountSearchPoolTests
 
     // The asset an ID-filtered search asks for.
     private static Guid IdOf(MetadataSearchDto dto) => dto.Filter!.Id!.Eq!.Value;
+
+    private static void VerifyRefusalWarning(Mock<ILogger> logger, Times times) =>
+        logger.Verify(l => l.Log(Microsoft.Extensions.Logging.LogLevel.Warning, It.IsAny<EventId>(),
+            It.Is<It.IsAnyType>((state, _) => state.ToString()!.Contains("refused the last")),
+            It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()), times);
 
     private void SetupSearch(Func<MetadataSearchDto, CancellationToken, Task<SearchResponseDto>> handler) =>
         _api.Setup(a => a.SearchAssetsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MetadataSearchDto>(), It.IsAny<CancellationToken>()))

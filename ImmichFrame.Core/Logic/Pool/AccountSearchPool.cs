@@ -24,8 +24,18 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
     /// <summary>The most asset loads that run at once for this pool, across every caller.</summary>
     public const int MaxParallelLoads = 4;
 
+    /// <summary>
+    /// After this many 400/403 answers in a row with no successful load, the API key looks to have
+    /// lost access: a warning is logged and refused assets stay in the deck. Fewer are taken to be
+    /// deleted or unshared assets and are dropped.
+    /// </summary>
+    public const int RefusalsBeforeWarning = 5;
+
     // The largest page the metadata search allows.
     private const int IdPageSize = 1000;
+
+    // Pages a listing may take beyond what the account's asset count needs, for assets added meanwhile.
+    private const int ExtraIdPages = 10;
 
     // Bounds the load cache. When full, expired entries are dropped; new ones wait for room.
     private const int MaxCachedLoads = 4096;
@@ -45,6 +55,9 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
     // nothing, is the oldest, so a deck never prefers it over a real one.
     private readonly AssetIdList _noIds = new([], 0);
     private long _lastListingVersion;
+
+    // 400/403 answers since the last successful load, across calls.
+    private int _refusalsInARow;
 
     // A null asset means it is gone or no longer selected.
     private sealed record CachedLoad(AssetResponseDto? Asset, DateTimeOffset LoadedAt);
@@ -115,10 +128,19 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
     private async Task<AssetIdList> ListAssetIds(CancellationToken ct)
     {
         var filter = SearchFilters.ForAccount(_accountSettings, await ResolveTagIds(ct));
+        // Bounds the paging, so a server that keeps handing out cursors cannot keep the listing going forever.
+        var stats = await _immichApi.SearchAssetStatisticsAsync(new StatisticsSearchDto { Filter = filter }, ct);
+        var maxPages = Math.Max(stats.Total, 0) / IdPageSize + ExtraIdPages;
         var ids = new List<Guid>();
         string? cursor = null;
+        var pages = 0;
         do
         {
+            if (++pages > maxPages)
+            {
+                throw new InvalidOperationException($"Immich returned more than {maxPages} pages of asset IDs for {stats.Total} assets; giving up on this listing");
+            }
+
             var response = await _immichApi.SearchAssetsAsync(null, null, new MetadataSearchDto
             {
                 Filter = filter,
@@ -153,8 +175,8 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
 
         var loaded = new AssetResponseDto?[ids.Count];
         var retry = new ConcurrentBag<int>();
-        var rejected = new ConcurrentBag<int>();
-        var searched = 0;
+        Exception? firstFailure = null;
+        var failures = 0;
         await Parallel.ForEachAsync(Enumerable.Range(0, ids.Count),
             new ParallelOptions { MaxDegreeOfParallelism = MaxParallelLoads, CancellationToken = ct },
             async (i, token) =>
@@ -165,11 +187,11 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
                     return;
                 }
 
-                Interlocked.Increment(ref searched);
                 try
                 {
                     loaded[i] = await LoadSelected(ids[i], tagIds, token);
                     CacheLoad(ids[i], loaded[i]);
+                    Interlocked.Exchange(ref _refusalsInARow, 0);
                 }
                 catch (ApiException e) when (e.StatusCode is 404)
                 {
@@ -178,26 +200,33 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
                 }
                 catch (ApiException e) when (e.StatusCode is 400 or 403)
                 {
-                    // Usually deleted, locked or no longer shared. Not cached, in case it is a passing permission problem.
+                    // Usually deleted, locked or no longer shared, so dropped. Not cached, in case it
+                    // is a passing permission problem. A long run of these looks like the API key
+                    // lost access: then the assets stay in the deck and the problem is logged once.
                     _logger.LogDebug("Immich answered {status} when loading asset {assetId}; skipping it", e.StatusCode, ids[i]);
-                    rejected.Add(i);
+                    var refusals = Interlocked.Increment(ref _refusalsInARow);
+                    if (refusals >= RefusalsBeforeWarning)
+                    {
+                        retry.Add(i);
+                    }
+
+                    if (refusals == RefusalsBeforeWarning)
+                    {
+                        _logger.LogWarning("Immich refused the last {count} asset loads (400/403). Check that the API key can still read the configured albums, people and tags; the assets stay in the deck.", refusals);
+                    }
                 }
-                catch (Exception) when (!token.IsCancellationRequested)
+                catch (Exception e) when (!token.IsCancellationRequested)
                 {
-                    _logger.LogWarning("Could not load asset {assetId}; it will be dealt again later", ids[i]);
+                    Interlocked.CompareExchange(ref firstFailure, e, null);
+                    Interlocked.Increment(ref failures);
                     retry.Add(i);
                 }
             });
 
-        // One rejected asset is most likely deleted. Every search in a batch rejected looks like
-        // the API key lost access, so the assets stay in the deck and the problem is logged.
-        if (rejected.Count >= 2 && rejected.Count == searched)
+        // Logged once per batch, so an outage does not log a line per asset.
+        if (firstFailure != null)
         {
-            _logger.LogWarning("Immich refused all {count} asset loads in a batch (400/403). Check that the API key can still read the configured albums, people and tags; the assets stay in the deck.", rejected.Count);
-            foreach (var i in rejected)
-            {
-                retry.Add(i);
-            }
+            _logger.LogWarning(firstFailure, "Could not load {count} of {total} assets; they will be dealt again later", failures, ids.Count);
         }
 
         return new AssetLoadResult(

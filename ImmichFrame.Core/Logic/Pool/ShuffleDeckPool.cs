@@ -24,6 +24,7 @@ public class ShuffleDeckPool(IDealableAssetPool source, TimeProvider? timeProvid
     /// <summary>
     /// A call deals at most this many cards per asset requested, counting the ones that could not
     /// be loaded (deleted, trashed or filtered out) and are replaced. Each card costs the source a load.
+    /// A round with a passing failure ends the call, so an outage costs one round per call.
     /// </summary>
     public const int LoadBudgetPerAsset = 2;
 
@@ -83,6 +84,12 @@ public class ShuffleDeckPool(IDealableAssetPool source, TimeProvider? timeProvid
                 pending = [];
                 assets.AddRange(result.Loaded);
                 unshown.AddRange(result.Retry);
+
+                // A passing failure means Immich is struggling; dealing more would only add to its load.
+                if (result.Retry.Count > 0)
+                {
+                    break;
+                }
             }
         }
         finally

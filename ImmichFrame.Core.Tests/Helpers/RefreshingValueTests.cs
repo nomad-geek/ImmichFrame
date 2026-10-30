@@ -202,6 +202,50 @@ public class RefreshingValueTests
     }
 
     [Test]
+    public async Task GetAsync_NoValueAndLoadKeepsFailing_NeverWaitsLongerThanTheFloor()
+    {
+        var time = new FakeTimeProvider();
+        var loads = 0;
+        using var value = new RefreshingValue<int>(_ =>
+        {
+            Interlocked.Increment(ref loads);
+            return Task.FromException<int>(new HttpRequestException("down"));
+        }, TimeSpan.FromHours(12), time);
+
+        for (var attempt = 1; attempt <= 12; attempt++)
+        {
+            Assert.That(async () => await value.GetAsync(), Throws.InstanceOf<HttpRequestException>());
+            Assert.That(loads, Is.EqualTo(attempt));
+            time.Now += RefreshingValue<int>.MaxBackoffWithoutValue;
+        }
+    }
+
+    [Test]
+    public async Task GetAsync_LongLifetimeRefreshKeepsFailing_RetriesWithinMaxBackoff()
+    {
+        var time = new FakeTimeProvider();
+        var lifetime = TimeSpan.FromHours(12);
+        var loads = 0;
+        using var value = new RefreshingValue<int>(_ =>
+        {
+            var n = Interlocked.Increment(ref loads);
+            return n > 1 ? throw new HttpRequestException("down") : Task.FromResult(n);
+        }, lifetime, time);
+
+        await value.GetAsync();
+        time.Now += lifetime;
+
+        for (var attempts = 2; attempts <= 12; attempts++)
+        {
+            Assert.That(await value.GetAsync(), Is.EqualTo(1));
+            await WaitFor(() => Task.FromResult(Volatile.Read(ref loads)), n => n == attempts);
+            // Let the failed load record its backoff before the clock moves.
+            await Task.Delay(20);
+            time.Now += RefreshingValue<int>.MaxBackoff;
+        }
+    }
+
+    [Test]
     public async Task GetAsync_RefreshFails_LogsTheFailure()
     {
         var time = new FakeTimeProvider();

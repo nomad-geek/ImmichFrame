@@ -196,9 +196,11 @@ namespace ImmichFrame.WebApi.Tests.Services
         }
 
         [TestCase("", null)]
+        [TestCase("   ", null)]
+        [TestCase(" \t\n", null)]
         [TestCase(null, null)]
         [TestCase("secret", "secret")]
-        public void AuthenticationSecret_EmptyMeansNoSecret(string? configured, string? expected)
+        public void AuthenticationSecret_EmptyOrWhitespaceMeansNoSecret(string? configured, string? expected)
         {
             Assert.That(new GeneralSettings { AuthenticationSecret = configured }.AuthenticationSecret, Is.EqualTo(expected));
         }
