@@ -71,7 +71,14 @@ public class GeneralSettings : IGeneralSettings
     public string? UnitSystem { get; set; } = "imperial";
     public string? WeatherLatLong { get; set; } = "40.7128,74.0060";
     public string? Webhook { get; set; }
-    public string? AuthenticationSecret { get; set; }
+    /// <summary>The bearer token the API asks for. An empty value means no secret, the same as leaving it out.</summary>
+    public string? AuthenticationSecret
+    {
+        get => _authenticationSecret;
+        set => _authenticationSecret = string.IsNullOrEmpty(value) ? null : value;
+    }
+
+    private string? _authenticationSecret;
     public string? AdminPassword { get; set; }
 
     public void Validate() { }

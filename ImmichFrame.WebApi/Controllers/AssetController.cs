@@ -3,6 +3,7 @@ using ImmichFrame.Core.Api;
 using ImmichFrame.Core.Exceptions;
 using ImmichFrame.Core.Interfaces;
 using ImmichFrame.Core.Models;
+using ImmichFrame.WebApi.Helpers;
 using ImmichFrame.WebApi.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -34,19 +35,10 @@ namespace ImmichFrame.WebApi.Controllers
             _settings = settings;
         }
 
-        /// <summary>The longest client identifier kept; it names the client's shuffle deck.</summary>
-        public const int MaxClientIdentifierLength = 64;
-
-        internal static string SanitizeClientId(string clientIdentifier)
-        {
-            var sanitized = clientIdentifier.SanitizeString();
-            return sanitized.Length > MaxClientIdentifierLength ? sanitized[..MaxClientIdentifierLength] : sanitized;
-        }
-
         [HttpGet(Name = "GetAssets")]
         public async Task<List<AssetResponseDto>> GetAssets(string clientIdentifier = "")
         {
-            var sanitizedClientIdentifier = SanitizeClientId(clientIdentifier);
+            var sanitizedClientIdentifier = ClientIdentifier.Sanitize(clientIdentifier);
             _logger.LogDebug("Assets requested by '{sanitizedClientIdentifier}'", sanitizedClientIdentifier);
             return (await _logic.GetAssets(sanitizedClientIdentifier, HttpContext.RequestAborted)).ToList();
         }
@@ -54,7 +46,7 @@ namespace ImmichFrame.WebApi.Controllers
         [HttpGet("{id}/AssetInfo", Name = "GetAssetInfo")]
         public async Task<AssetResponseDto> GetAssetInfo(Guid id, string clientIdentifier = "")
         {
-            var sanitizedClientIdentifier = SanitizeClientId(clientIdentifier);
+            var sanitizedClientIdentifier = ClientIdentifier.Sanitize(clientIdentifier);
             _logger.LogDebug("AssetInfo '{id}' requested by '{sanitizedClientIdentifier}'", id, sanitizedClientIdentifier);
 
             return await _logic.GetAssetInfoById(id);
@@ -63,7 +55,7 @@ namespace ImmichFrame.WebApi.Controllers
         [HttpGet("{id}/AssetFaces", Name = "GetAssetFaces")]
         public async Task<IEnumerable<AssetFaceResponseDto>> GetAssetFaces(Guid id, string clientIdentifier = "")
         {
-            var sanitizedClientIdentifier = SanitizeClientId(clientIdentifier);
+            var sanitizedClientIdentifier = ClientIdentifier.Sanitize(clientIdentifier);
             _logger.LogDebug("AssetFaces '{id}' requested by '{sanitizedClientIdentifier}'", id, sanitizedClientIdentifier);
 
             return await _logic.GetAssetFacesById(id);
@@ -72,7 +64,7 @@ namespace ImmichFrame.WebApi.Controllers
         [HttpGet("{id}/AlbumInfo", Name = "GetAlbumInfo")]
         public async Task<List<AlbumResponseDto>> GetAlbumInfo(Guid id, string clientIdentifier = "")
         {
-            var sanitizedClientIdentifier = SanitizeClientId(clientIdentifier);
+            var sanitizedClientIdentifier = ClientIdentifier.Sanitize(clientIdentifier);
             _logger.LogDebug("AlbumInfo '{id}' requested by '{sanitizedClientIdentifier}'", id, sanitizedClientIdentifier);
 
             return (await _logic.GetAlbumInfoById(id)).ToList() ?? throw new AssetNotFoundException("No asset was found");
@@ -94,7 +86,7 @@ namespace ImmichFrame.WebApi.Controllers
         [ProducesResponseType(StatusCodes.Status416RangeNotSatisfiable)]
         public async Task<IActionResult> GetAsset(Guid id, string clientIdentifier = "", AssetTypeEnum? assetType = null)
         {
-            var sanitizedClientIdentifier = SanitizeClientId(clientIdentifier);
+            var sanitizedClientIdentifier = ClientIdentifier.Sanitize(clientIdentifier);
             _logger.LogDebug("Asset '{id}' requested by '{sanitizedClientIdentifier}' (type hint: {assetType})", id, sanitizedClientIdentifier, assetType);
 
             var rangeHeader = Request.Headers["Range"].FirstOrDefault();
@@ -145,7 +137,7 @@ namespace ImmichFrame.WebApi.Controllers
         [Produces("application/json")]
         public async Task<ImageResponse> GetRandomImageAndInfo(string clientIdentifier = "")
         {
-            var sanitizedClientIdentifier = SanitizeClientId(clientIdentifier);
+            var sanitizedClientIdentifier = ClientIdentifier.Sanitize(clientIdentifier);
             _logger.LogDebug("Random image requested by '{sanitizedClientIdentifier}'", sanitizedClientIdentifier);
 
             AssetResponseDto? randomAsset = null;

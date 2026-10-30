@@ -16,12 +16,16 @@ public sealed class ShuffleDeck(Random random)
     private AssetIdList _list = NoMembers;
     private bool _synced;
 
-    // The rest of the current cycle, dealt from the end.
+    // The rest of the current cycle, dealt from the end, and the same cards as a set.
     private readonly List<Guid> _undealt = [];
+    private readonly HashSet<Guid> _undealtSet = [];
 
     // The last cards dealt, oldest first.
     private readonly List<Guid> _recent = [];
     private int _recentCapacity = RecentWindow;
+
+    // The cards the last refill kept out of the start of its cycle, until each is dealt.
+    private readonly HashSet<Guid> _held = [];
 
     /// <summary>The version of the listing this deck was last synced with, or -1 before the first sync.</summary>
     public long Version => _synced ? _list.Version : -1;
@@ -48,7 +52,9 @@ public sealed class ShuffleDeck(Random random)
         var previous = _list;
         var members = list.Members;
         _undealt.RemoveAll(id => !members.Contains(id));
+        _undealtSet.RemoveWhere(id => !members.Contains(id));
         _recent.RemoveAll(id => !members.Contains(id));
+        _held.RemoveWhere(id => !members.Contains(id));
 
         // Newcomers join the rest of the current cycle at a uniformly random position. With nothing
         // left in the cycle (including the first sync) they wait for the next one, which shuffles
@@ -59,7 +65,7 @@ public sealed class ShuffleDeck(Random random)
             {
                 if (!previous.Members.Contains(id))
                 {
-                    _undealt.Insert(random.Next(_undealt.Count + 1), id);
+                    AddUndealt(id);
                 }
             }
         }
@@ -90,6 +96,8 @@ public sealed class ShuffleDeck(Random random)
 
             var card = _undealt[^1];
             _undealt.RemoveAt(_undealt.Count - 1);
+            _undealtSet.Remove(card);
+            _held.Remove(card);
             dealt.Add(card);
             Remember(card);
         }
@@ -105,11 +113,35 @@ public sealed class ShuffleDeck(Random random)
     {
         foreach (var card in cards)
         {
-            if (_list.Members.Contains(card) && !_undealt.Contains(card))
+            if (_list.Members.Contains(card) && !_undealtSet.Contains(card))
             {
-                _undealt.Insert(random.Next(_undealt.Count + 1), card);
+                AddUndealt(card);
             }
         }
+    }
+
+    // Puts a card at a uniformly random place in the rest of the cycle without shifting the list:
+    // it takes the place of the card there, which moves to the end and is dealt next. A recently
+    // card held back by the last refill must stay away from the end, so in that case the card is inserted instead.
+    private void AddUndealt(Guid card)
+    {
+        _undealtSet.Add(card);
+        var position = random.Next(_undealt.Count + 1);
+        if (position == _undealt.Count)
+        {
+            _undealt.Add(card);
+            return;
+        }
+
+        var displaced = _undealt[position];
+        if (_held.Contains(displaced))
+        {
+            _undealt.Insert(position, card);
+            return;
+        }
+
+        _undealt[position] = card;
+        _undealt.Add(displaced);
     }
 
     private void Remember(Guid card)
@@ -156,8 +188,16 @@ public sealed class ShuffleDeck(Random random)
             (order[0], order[other]) = (order[other], order[0]);
         }
 
+        _held.Clear();
+        _held.UnionWith(avoid);
+        if (n >= 2 && _recent.Count > 0)
+        {
+            _held.Add(_recent[^1]);
+        }
+
         order.Reverse();
         _undealt.AddRange(order);
+        _undealtSet.UnionWith(order);
     }
 
     private void Shuffle(List<Guid> list)

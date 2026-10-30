@@ -1,11 +1,10 @@
 using ImmichFrame.Core.Interfaces;
+using ImmichFrame.WebApi.Helpers;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Security.Claims;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Encodings.Web;
 
 public class ImmichFrameAuthenticationHandler : AuthenticationHandler<AuthenticationSchemeOptions>
@@ -49,7 +48,7 @@ public class ImmichFrameAuthenticationHandler : AuthenticationHandler<Authentica
         {
             var token = authHeader.Substring("Bearer ".Length).Trim();
 
-            if (SecretMatches(_authenticationSecret, token))
+            if (SecretComparison.Matches(_authenticationSecret, token))
             {
                 var claims = new[] { new Claim(ClaimTypes.NameIdentifier, "authenticatedUser") };
                 var identity = new ClaimsIdentity(claims, Scheme.Name);
@@ -64,11 +63,4 @@ public class ImmichFrameAuthenticationHandler : AuthenticationHandler<Authentica
 
         return Task.FromResult(AuthenticateResult.Fail("Invalid Authorization Header"));
     }
-
-    // Compares in constant time. Hashing first gives both sides the same length, so the
-    // comparison reveals neither the secret's content nor its length.
-    internal static bool SecretMatches(string expected, string given)
-        => CryptographicOperations.FixedTimeEquals(
-            SHA256.HashData(Encoding.UTF8.GetBytes(expected)),
-            SHA256.HashData(Encoding.UTF8.GetBytes(given)));
 }

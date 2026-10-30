@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using ImmichFrame.Core.Api;
 using ImmichFrame.Core.Interfaces;
 
@@ -12,9 +13,13 @@ public abstract class CachingApiAssetsPool(IApiCache apiCache) : IDealableAssetP
     private readonly object _loadGate = new();
     private Task<IEnumerable<AssetResponseDto>>? _loading;
 
-    // IDs and a lookup built from one instance of the cached list, so the listing stays the same
-    // instance (and version) until the cache reloads.
-    private sealed record AssetIndex(IEnumerable<AssetResponseDto> Source, AssetIdList Ids, IReadOnlyDictionary<Guid, AssetResponseDto> ById);
+    // The order each loaded list was loaded in, so an index is never rebuilt from an older one.
+    private readonly ConditionalWeakTable<IEnumerable<AssetResponseDto>, StrongBox<long>> _loadVersions = new();
+    private long _lastLoadVersion;
+
+    // IDs and a lookup built from one loaded list, so the listing stays the same instance (and
+    // version) until a newer load replaces it.
+    private sealed record AssetIndex(long Version, AssetIdList Ids, IReadOnlyDictionary<Guid, AssetResponseDto> ById);
 
     public async Task<long> GetAssetCount(CancellationToken ct = default)
     {
@@ -40,17 +45,28 @@ public abstract class CachingApiAssetsPool(IApiCache apiCache) : IDealableAssetP
     private async Task<AssetIndex> GetIndex(CancellationToken ct)
     {
         var all = await AllAssets(ct);
+        var version = LoadVersionOf(all);
         lock (_indexGate)
         {
-            if (_index == null || !ReferenceEquals(_index.Source, all))
+            if (_index != null && version <= _index.Version)
             {
-                var byId = new Dictionary<Guid, AssetResponseDto>();
-                foreach (var asset in all)
-                {
-                    byId.TryAdd(asset.Id, asset);
-                }
+                return _index;
+            }
+        }
 
-                _index = new AssetIndex(all, new AssetIdList(byId.Keys), byId);
+        var byId = new Dictionary<Guid, AssetResponseDto>();
+        foreach (var asset in all)
+        {
+            byId.TryAdd(asset.Id, asset);
+        }
+
+        var index = new AssetIndex(version, new AssetIdList(byId.Keys, version), byId);
+        lock (_indexGate)
+        {
+            // Another caller may have built a newer index meanwhile.
+            if (_index == null || index.Version > _index.Version)
+            {
+                _index = index;
             }
 
             return _index;
@@ -71,7 +87,9 @@ public abstract class CachingApiAssetsPool(IApiCache apiCache) : IDealableAssetP
             {
                 try
                 {
-                    return await LoadAssets(CancellationToken.None);
+                    var assets = await LoadAssets(CancellationToken.None);
+                    _loadVersions.AddOrUpdate(assets, new StrongBox<long>(Interlocked.Increment(ref _lastLoadVersion)));
+                    return assets;
                 }
                 finally
                 {
@@ -83,6 +101,10 @@ public abstract class CachingApiAssetsPool(IApiCache apiCache) : IDealableAssetP
             });
         }
     }
+
+    // A list that did not come through LoadOnce counts as loaded now.
+    private long LoadVersionOf(IEnumerable<AssetResponseDto> assets) =>
+        _loadVersions.GetValue(assets, _ => new StrongBox<long>(Interlocked.Increment(ref _lastLoadVersion))).Value;
 
     protected abstract Task<IEnumerable<AssetResponseDto>> LoadAssets(CancellationToken ct = default);
 }

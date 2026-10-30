@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using ImmichFrame.Core.Api;
 using ImmichFrame.Core.Helpers;
 using ImmichFrame.Core.Interfaces;
@@ -605,6 +606,132 @@ public class AccountSearchPoolTests
         Assert.That(result, Has.Count.EqualTo(5));
         Assert.That(result, Is.Unique);
         Assert.That(result, Does.Not.Contain(leftFilter!.Value));
+    }
+
+    [Test]
+    public async Task LoadAssetsByIds_ConcurrentCallers_ShareOneLoadCap()
+    {
+        var running = 0;
+        var peak = 0;
+        SetupLoads(async id =>
+        {
+            var now = Interlocked.Increment(ref running);
+            InterlockedMax(ref peak, now);
+            await Task.Delay(20);
+            Interlocked.Decrement(ref running);
+            return Asset(id);
+        });
+
+        var callers = Enumerable.Range(0, 6)
+            .Select(c => Task.Run(() => _pool.LoadAssetsByIds(Ids($"caller{c}", 8))))
+            .ToList();
+        var results = await Task.WhenAll(callers);
+
+        Assert.That(results.Sum(r => r.Loaded.Count), Is.EqualTo(48));
+        Assert.That(peak, Is.LessThanOrEqualTo(AccountSearchPool.MaxParallelLoads));
+    }
+
+    [Test]
+    public async Task LoadAssetsByIds_SameIdWithinCacheLifetime_IsNotSearchedAgain()
+    {
+        var time = new FakeTimeProvider();
+        using var pool = new AccountSearchPool(_cache.Object, _api.Object, _settings.Object, timeProvider: time);
+        var id = FixtureHelpers.GuidFor("cached");
+        var gone = FixtureHelpers.GuidFor("gone");
+        var searches = new ConcurrentDictionary<Guid, int>();
+        SetupLoads(asked =>
+        {
+            searches.AddOrUpdate(asked, 1, (_, n) => n + 1);
+            return asked == gone ? throw ApiError(404) : Task.FromResult<AssetResponseDto?>(Asset(asked));
+        });
+
+        await pool.LoadAssetsByIds(new List<Guid> { id, gone });
+        time.Now += AccountSearchPool.LoadCacheLifetime - TimeSpan.FromSeconds(1);
+        var again = await pool.LoadAssetsByIds(new List<Guid> { gone, id });
+
+        Assert.That(again.Loaded.Select(a => a.Id), Is.EqualTo(new[] { id }));
+        Assert.That(searches[id], Is.EqualTo(1));
+        Assert.That(searches[gone], Is.EqualTo(1));
+
+        time.Now += TimeSpan.FromSeconds(1);
+        await pool.LoadAssetsByIds(new List<Guid> { id });
+
+        Assert.That(searches[id], Is.EqualTo(2));
+    }
+
+    [Test]
+    public async Task LoadAssetsByIds_RetriedFailure_IsNotCached()
+    {
+        var id = FixtureHelpers.GuidFor("flaky");
+        var searches = 0;
+        SetupLoads(asked => Interlocked.Increment(ref searches) == 1
+            ? throw ApiError(500)
+            : Task.FromResult<AssetResponseDto?>(Asset(asked)));
+
+        var first = await _pool.LoadAssetsByIds(new List<Guid> { id });
+        var second = await _pool.LoadAssetsByIds(new List<Guid> { id });
+
+        Assert.That(first.Retry, Is.EqualTo(new[] { id }));
+        Assert.That(second.Loaded.Select(a => a.Id), Is.EqualTo(new[] { id }));
+        Assert.That(searches, Is.EqualTo(2));
+    }
+
+    [TestCase(400)]
+    [TestCase(403)]
+    public async Task LoadAssetsByIds_EveryLoadRejected_ReturnsIdsToDeckAndWarns(int status)
+    {
+        var ids = Ids("rejected", 5);
+        SetupLoads(_ => throw ApiError(status));
+        var logger = new Mock<ILogger>();
+        using var pool = new AccountSearchPool(_cache.Object, _api.Object, _settings.Object, logger: logger.Object);
+
+        var result = await pool.LoadAssetsByIds(ids);
+
+        Assert.That(result.Loaded, Is.Empty);
+        Assert.That(result.Retry, Is.EqualTo(ids));
+        logger.Verify(l => l.Log(Microsoft.Extensions.Logging.LogLevel.Warning, It.IsAny<EventId>(),
+            It.Is<It.IsAnyType>((state, _) => state.ToString()!.Contains("refused all 5")),
+            It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()), Times.Once);
+        logger.Verify(l => l.Log(Microsoft.Extensions.Logging.LogLevel.Debug, It.IsAny<EventId>(),
+            It.Is<It.IsAnyType>((state, _) => state.ToString()!.Contains(status.ToString())),
+            It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()), Times.Exactly(5));
+    }
+
+    [Test]
+    public async Task GetAllAssetIds_SelectsNothingThenSomething_RealListingIsNewer()
+    {
+        var tags = new List<TagResponseDto>();
+        _settings.SetupGet(s => s.Tags).Returns(new List<string> { "later" });
+        _api.Setup(a => a.GetAllTagsAsync(It.IsAny<CancellationToken>())).ReturnsAsync(() => (ICollection<TagResponseDto>)tags.ToList());
+        SetupSearch((_, _) => Task.FromResult(SearchPage(Ids("tagged", 3), null)));
+
+        var empty = await _pool.GetAllAssetIds();
+        var emptyAgain = await _pool.GetAllAssetIds();
+        tags.Add(new TagResponseDto { Id = FixtureHelpers.GuidFor("tag"), Value = "later" });
+        var listing = await _pool.GetAllAssetIds();
+        tags.Clear();
+        var emptyAfter = await _pool.GetAllAssetIds();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(emptyAgain, Is.SameAs(empty));
+            Assert.That(emptyAfter, Is.SameAs(empty));
+            Assert.That(listing.Count, Is.EqualTo(3));
+            Assert.That(listing.Version, Is.GreaterThan(empty.Version));
+        });
+
+        // A deck synced to the real listing keeps it when the empty one comes round again.
+        var deck = new ShuffleDeck(new Random(1));
+        deck.Sync(listing);
+        Assert.That(deck.Sync(emptyAfter), Is.False);
+    }
+
+    private static void InterlockedMax(ref int target, int value)
+    {
+        int seen;
+        while ((seen = Volatile.Read(ref target)) < value && Interlocked.CompareExchange(ref target, value, seen) != seen)
+        {
+        }
     }
 
     private static List<Guid> Ids(string prefix, int count) =>

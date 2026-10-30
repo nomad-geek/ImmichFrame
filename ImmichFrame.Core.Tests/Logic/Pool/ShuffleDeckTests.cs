@@ -376,4 +376,59 @@ public class ShuffleDeckTests
         Assert.That(undealt, Is.EquivalentTo(ids.Except(first.Skip(1))));
         Assert.That(DealSingles(deck, 1), Is.EqualTo(new[] { undealt[0] }));
     }
+
+    [Test]
+    public void Sync_AddingIdsAfterCycleJoin_KeepsRecentCardsOutOfItsStart()
+    {
+        var ids = Ids(60);
+        var newcomers = Ids(30, "new");
+        foreach (var seed in Seeds)
+        {
+            var deck = NewDeck(seed, ids);
+            var lastCycle = DealSingles(deck, 60);
+            DealSingles(deck, 1);
+
+            deck.Sync(ids.Concat(newcomers).ToList());
+            var next = DealSingles(deck, ShuffleDeck.RecentWindow - 1);
+
+            Assert.That(next.Intersect(lastCycle.TakeLast(ShuffleDeck.RecentWindow)), Is.Empty, $"seed {seed}");
+        }
+    }
+
+    [Test]
+    public void Sync_ManyNewcomersIntoLargeDeck_TakesLinearTime()
+    {
+        var ids = Enumerable.Range(0, 100_000).Select(_ => Guid.NewGuid()).ToList();
+        var deck = NewDeck(1, ids);
+        deck.Deal(1);
+        var grown = ids.Concat(Enumerable.Range(0, 50_000).Select(_ => Guid.NewGuid())).ToList();
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        deck.Sync(grown);
+        watch.Stop();
+
+        // Inserting each newcomer by shifting the list takes tens of seconds here.
+        Assert.That(watch.Elapsed, Is.LessThan(TimeSpan.FromSeconds(2)));
+        Assert.That(deck.Deal(grown.Count - 1), Is.Unique);
+    }
+
+    [Test]
+    public void Return_ManyCallsOnLargeDeck_CostsNothingPerDeckSize()
+    {
+        var ids = Enumerable.Range(0, 200_000).Select(_ => Guid.NewGuid()).ToList();
+        var deck = NewDeck(1, ids);
+        deck.Deal(1);
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        for (var i = 0; i < 2_000; i++)
+        {
+            deck.Return(deck.Deal(25));
+        }
+
+        watch.Stop();
+
+        // A scan and a shift of the whole deck per returned card takes many seconds here.
+        Assert.That(watch.Elapsed, Is.LessThan(TimeSpan.FromSeconds(2)));
+        Assert.That(deck.Deal(ids.Count - 1), Is.Unique);
+    }
 }

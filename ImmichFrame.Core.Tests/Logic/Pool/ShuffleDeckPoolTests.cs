@@ -335,17 +335,32 @@ public class ShuffleDeckPoolTests
     }
 
     [Test]
-    public async Task GetAssets_AllAssetsMissing_StopsAfterThreeTopUpRounds()
+    public async Task GetAssets_AllAssetsMissing_StopsAtTheLoadBudget()
     {
-        var ids = Ids(20);
+        var ids = Ids(100);
         _source.Ids = ids;
         _source.LeftOut.UnionWith(ids);
 
         var assets = await _pool.GetAssets(5, "a");
 
         Assert.That(assets, Is.Empty);
-        Assert.That(_source.LoadAssetsByIdsCalls, Is.EqualTo(4));
-        Assert.That(_source.LoadRequests.SelectMany(r => r), Is.Unique);
+        var loaded = _source.LoadRequests.SelectMany(r => r).ToList();
+        Assert.That(loaded, Has.Count.EqualTo(5 * ShuffleDeckPool.LoadBudgetPerAsset));
+        Assert.That(loaded, Is.Unique);
+    }
+
+    [Test]
+    public async Task GetAssets_SomeAssetsMissing_TopUpNeverExceedsTheLoadBudget()
+    {
+        var ids = Ids(100);
+        _source.Ids = ids;
+        // Only one asset in three can be loaded, so the budget runs out before the batch fills.
+        _source.LeaveOut = (_, requested) => requested.Where((_, i) => i % 3 != 0);
+
+        var assets = await _pool.GetAssets(6, "a");
+
+        Assert.That(_source.LoadRequests.Sum(r => r.Count), Is.EqualTo(12));
+        Assert.That(assets.Count(), Is.LessThan(6));
     }
 
     [Test]

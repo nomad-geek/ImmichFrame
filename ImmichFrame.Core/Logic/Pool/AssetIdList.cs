@@ -10,7 +10,16 @@ public sealed class AssetIdList
 {
     private static long _lastVersion;
 
-    public AssetIdList(IEnumerable<Guid> ids)
+    /// <summary>A listing with a version from a process-wide counter, newer than every listing made before it.</summary>
+    public AssetIdList(IEnumerable<Guid> ids) : this(ids, Interlocked.Increment(ref _lastVersion))
+    {
+    }
+
+    /// <summary>
+    /// A listing with a version its source assigns, growing in the order the source loaded its
+    /// data. Versions only compare between listings of the same source.
+    /// </summary>
+    public AssetIdList(IEnumerable<Guid> ids, long version)
     {
         var members = new HashSet<Guid>();
         var ordered = new List<Guid>();
@@ -24,10 +33,10 @@ public sealed class AssetIdList
 
         Ids = ordered;
         Members = members;
-        Version = Interlocked.Increment(ref _lastVersion);
+        Version = version;
     }
 
-    /// <summary>Grows with every listing made, so a deck can tell a newer listing from an older one.</summary>
+    /// <summary>Grows with every listing a source makes, so a deck can tell a newer listing from an older one.</summary>
     public long Version { get; }
 
     /// <summary>The distinct IDs, in listing order.</summary>

@@ -45,7 +45,7 @@ Defaults are below, only one account with `ImmichServerUrl` and `ApiKey`|`ApiKey
 ```yaml
 # settings applicable to the web client - when viewing with a browser or webview
 General:
-  # When set, every client needs to authenticate via Bearer Token and this value.
+  # When set (and not empty), every client needs to authenticate via Bearer Token and this value.
   AuthenticationSecret: null # string, no default
   # whether to download images to the server
   DownloadImages: false # boolean
@@ -200,6 +200,11 @@ Accounts:
 
 :::tip
 Set an `AuthenticationSecret` (see [Security](#security)) when you use `Exhaustive`. ImmichFrame keeps an order for each frame that asks, and fetches the photo list from Immich, so on an open port anyone who can reach ImmichFrame can make it do that work. ImmichFrame logs a warning at startup when `Exhaustive` is on without a secret.
+
+What that work costs:
+
+- Every photo dealt is looked up in Immich with one search request, so the account's settings are checked at the moment it is shown. A batch of 25 photos is up to 25 searches, and when photos have to be skipped a request can deal at most twice what it asked for, so at most 50. At most 4 of these searches run at once per account, however many frames are asking, and a photo looked up in the last 3 minutes is not searched again.
+- Anyone who can reach the port can claim frame slots by sending made-up frame names. Their frames take the 32 slots and share the common order once new frames are rate-limited, so a real frame that is new, or has been idle for more than 10 minutes, may have to share the common order too. Its photos still show, but it doesn't get its own cycle.
 :::
 
 ### Weather

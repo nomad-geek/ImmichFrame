@@ -21,8 +21,11 @@ public class ShuffleDeckPool(IDealableAssetPool source, TimeProvider? timeProvid
     /// <summary>A deck used this recently is never evicted to make room for a new one.</summary>
     public static readonly TimeSpan ProtectedFor = TimeSpan.FromMinutes(10);
 
-    // Rounds of extra dealing when some dealt assets could not be loaded (deleted, trashed or filtered out).
-    private const int MaxTopUpRounds = 3;
+    /// <summary>
+    /// A call deals at most this many cards per asset requested, counting the ones that could not
+    /// be loaded (deleted, trashed or filtered out) and are replaced. Each card costs the source a load.
+    /// </summary>
+    public const int LoadBudgetPerAsset = 2;
 
     private readonly TimeProvider _time = timeProvider ?? TimeProvider.System;
 
@@ -56,14 +59,16 @@ public class ShuffleDeckPool(IDealableAssetPool source, TimeProvider? timeProvid
         // Dealt but not shown: they go back to the deck when this call ends.
         var unshown = new List<Guid>();
         IReadOnlyList<Guid> pending = [];
+        var budget = requested > int.MaxValue / LoadBudgetPerAsset ? int.MaxValue : requested * LoadBudgetPerAsset;
         try
         {
-            for (var round = 0; round <= MaxTopUpRounds && assets.Count < requested; round++)
+            while (assets.Count < requested && budget > 0)
             {
                 lock (entry)
                 {
                     entry.Deck.Sync(list);
-                    var dealt = entry.Deck.Deal(requested - assets.Count);
+                    var dealt = entry.Deck.Deal(Math.Min(requested - assets.Count, budget));
+                    budget -= dealt.Count;
                     // A card dealt again after the deck wrapped within this call counts for the next cycle.
                     pending = dealt.Where(seen.Add).ToList();
                     unshown.AddRange(dealt.Except(pending));

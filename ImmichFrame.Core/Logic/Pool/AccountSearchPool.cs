@@ -15,15 +15,39 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
     /// </summary>
     public static readonly TimeSpan MinIdListLifetime = TimeSpan.FromMinutes(5);
 
+    /// <summary>
+    /// How long a loaded asset (or the news that it is gone) is kept, so dealing it again soon,
+    /// to another frame or after a deck wraps, costs no search.
+    /// </summary>
+    public static readonly TimeSpan LoadCacheLifetime = TimeSpan.FromMinutes(3);
+
+    /// <summary>The most asset loads that run at once for this pool, across every caller.</summary>
+    public const int MaxParallelLoads = 4;
+
     // The largest page the metadata search allows.
     private const int IdPageSize = 1000;
-    private const int MaxParallelLoads = 4;
+
+    // Bounds the load cache. When full, expired entries are dropped; new ones wait for room.
+    private const int MaxCachedLoads = 4096;
 
     private readonly IApiCache _apiCache;
     private readonly ImmichApi _immichApi;
     private readonly IAccountSettings _accountSettings;
     private readonly ILogger _logger;
+    private readonly TimeProvider _time;
     private readonly RefreshingValue<AssetIdList> _ids;
+    private readonly SemaphoreSlim _loadSlots = new(MaxParallelLoads, MaxParallelLoads);
+
+    private readonly object _loadCacheGate = new();
+    private readonly Dictionary<Guid, CachedLoad> _loadCache = new();
+
+    // Listings are versioned in load order. The empty listing, used while the filter selects
+    // nothing, is the oldest, so a deck never prefers it over a real one.
+    private readonly AssetIdList _noIds = new([], 0);
+    private long _lastListingVersion;
+
+    // A null asset means it is gone or no longer selected.
+    private sealed record CachedLoad(AssetResponseDto? Asset, DateTimeOffset LoadedAt);
 
     public AccountSearchPool(IApiCache apiCache, ImmichApi immichApi, IAccountSettings accountSettings,
         TimeSpan? idListLifetime = null, TimeProvider? timeProvider = null, ILogger? logger = null)
@@ -32,8 +56,9 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
         _immichApi = immichApi;
         _accountSettings = accountSettings;
         _logger = logger ?? NullLogger.Instance;
+        _time = timeProvider ?? TimeProvider.System;
         var lifetime = idListLifetime is { } requested && requested > MinIdListLifetime ? requested : MinIdListLifetime;
-        _ids = new RefreshingValue<AssetIdList>(ListAssetIds, lifetime, timeProvider);
+        _ids = new RefreshingValue<AssetIdList>(ListAssetIds, lifetime, _time, _logger, description: "asset ID listing");
     }
 
     /// <summary>How long an ID listing is kept before it is refreshed.</summary>
@@ -80,7 +105,7 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
         var tagIds = await ResolveTagIds(ct);
         if (!SelectsAnything(tagIds))
         {
-            return new AssetIdList([]);
+            return _noIds;
         }
 
         return await _ids.GetAsync(ct);
@@ -107,13 +132,16 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
             cursor = response.Assets.NextCursor;
         } while (!string.IsNullOrEmpty(cursor));
 
-        return new AssetIdList(ids);
+        // Listings run one at a time, so this follows load order.
+        return new AssetIdList(ids, Interlocked.Increment(ref _lastListingVersion));
     }
 
     /// <summary>
     /// Loads each asset through the account's filter plus an ID filter, so an asset that has left
     /// the selection since the listing (removed from the album, unfavourited, archived, retagged,
-    /// trashed) is left out rather than shown.
+    /// trashed) is left out rather than shown. Every load costs one Immich search, so results are
+    /// kept for <see cref="LoadCacheLifetime"/> and at most <see cref="MaxParallelLoads"/> run at
+    /// once across all callers.
     /// </summary>
     public async Task<AssetLoadResult> LoadAssetsByIds(IReadOnlyList<Guid> ids, CancellationToken ct = default)
     {
@@ -125,17 +153,34 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
 
         var loaded = new AssetResponseDto?[ids.Count];
         var retry = new ConcurrentBag<int>();
+        var rejected = new ConcurrentBag<int>();
+        var searched = 0;
         await Parallel.ForEachAsync(Enumerable.Range(0, ids.Count),
             new ParallelOptions { MaxDegreeOfParallelism = MaxParallelLoads, CancellationToken = ct },
             async (i, token) =>
             {
+                if (TryGetCachedLoad(ids[i], out var cached))
+                {
+                    loaded[i] = cached;
+                    return;
+                }
+
+                Interlocked.Increment(ref searched);
                 try
                 {
                     loaded[i] = await LoadSelected(ids[i], tagIds, token);
+                    CacheLoad(ids[i], loaded[i]);
                 }
-                catch (ApiException e) when (e.StatusCode is 400 or 403 or 404)
+                catch (ApiException e) when (e.StatusCode is 404)
                 {
-                    // Deleted, locked or no longer shared since the listing.
+                    // Deleted since the listing.
+                    CacheLoad(ids[i], null);
+                }
+                catch (ApiException e) when (e.StatusCode is 400 or 403)
+                {
+                    // Usually deleted, locked or no longer shared. Not cached, in case it is a passing permission problem.
+                    _logger.LogDebug("Immich answered {status} when loading asset {assetId}; skipping it", e.StatusCode, ids[i]);
+                    rejected.Add(i);
                 }
                 catch (Exception) when (!token.IsCancellationRequested)
                 {
@@ -143,6 +188,17 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
                     retry.Add(i);
                 }
             });
+
+        // One rejected asset is most likely deleted. Every search in a batch rejected looks like
+        // the API key lost access, so the assets stay in the deck and the problem is logged.
+        if (rejected.Count >= 2 && rejected.Count == searched)
+        {
+            _logger.LogWarning("Immich refused all {count} asset loads in a batch (400/403). Check that the API key can still read the configured albums, people and tags; the assets stay in the deck.", rejected.Count);
+            foreach (var i in rejected)
+            {
+                retry.Add(i);
+            }
+        }
 
         return new AssetLoadResult(
             loaded.OfType<AssetResponseDto>().ToList(),
@@ -153,16 +209,67 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
     {
         var filter = SearchFilters.ForAccount(_accountSettings, tagIds);
         filter.Id = new IdFilter { Eq = id };
-        var response = await _immichApi.SearchAssetsAsync(null, null, new MetadataSearchDto
+        SearchResponseDto response;
+        await _loadSlots.WaitAsync(ct);
+        try
         {
-            Filter = filter,
-            Size = 1,
-            WithExif = true,
-            WithPeople = true
-        }, ct);
+            response = await _immichApi.SearchAssetsAsync(null, null, new MetadataSearchDto
+            {
+                Filter = filter,
+                Size = 1,
+                WithExif = true,
+                WithPeople = true
+            }, ct);
+        }
+        finally
+        {
+            _loadSlots.Release();
+        }
 
         var asset = response.Assets.Items.FirstOrDefault(a => a.Id == id);
         return asset is { IsTrashed: not true } ? asset : null;
+    }
+
+    private bool TryGetCachedLoad(Guid id, out AssetResponseDto? asset)
+    {
+        lock (_loadCacheGate)
+        {
+            if (_loadCache.TryGetValue(id, out var entry))
+            {
+                if (_time.GetUtcNow() - entry.LoadedAt < LoadCacheLifetime)
+                {
+                    asset = entry.Asset;
+                    return true;
+                }
+
+                _loadCache.Remove(id);
+            }
+        }
+
+        asset = null;
+        return false;
+    }
+
+    private void CacheLoad(Guid id, AssetResponseDto? asset)
+    {
+        lock (_loadCacheGate)
+        {
+            var now = _time.GetUtcNow();
+            if (_loadCache.Count >= MaxCachedLoads && !_loadCache.ContainsKey(id))
+            {
+                foreach (var expired in _loadCache.Where(e => now - e.Value.LoadedAt >= LoadCacheLifetime).Select(e => e.Key).ToList())
+                {
+                    _loadCache.Remove(expired);
+                }
+
+                if (_loadCache.Count >= MaxCachedLoads)
+                {
+                    return;
+                }
+            }
+
+            _loadCache[id] = new CachedLoad(asset, now);
+        }
     }
 
     private bool SelectsAnything(IReadOnlyCollection<Guid> tagIds) =>
@@ -184,5 +291,6 @@ public class AccountSearchPool : IDealableAssetPool, IDisposable
             .ToList();
     }
 
+    // _loadSlots is not disposed: a load still running may yet release it.
     public void Dispose() => _ids.Dispose();
 }

@@ -1,4 +1,6 @@
 using ImmichFrame.Core.Helpers;
+using Microsoft.Extensions.Logging;
+using Moq;
 using NUnit.Framework;
 
 namespace ImmichFrame.Core.Tests.Helpers;
@@ -120,16 +122,22 @@ public class RefreshingValueTests
     }
 
     [Test]
-    public async Task GetAsync_FirstLoadFails_NextCallLoadsAgain()
+    public async Task GetAsync_FirstLoadFails_RethrowsUntilBackoffEndsThenLoadsAgain()
     {
+        var time = new FakeTimeProvider();
         var loads = 0;
         using var value = new RefreshingValue<int>(_ =>
         {
             var n = Interlocked.Increment(ref loads);
             return n == 1 ? throw new HttpRequestException("down") : Task.FromResult(n);
-        }, TimeSpan.FromMinutes(5));
+        }, TimeSpan.FromMinutes(5), time);
 
         Assert.That(async () => await value.GetAsync(), Throws.InstanceOf<HttpRequestException>());
+        time.Now += RefreshingValue<int>.InitialBackoff - TimeSpan.FromSeconds(1);
+        Assert.That(async () => await value.GetAsync(), Throws.InstanceOf<HttpRequestException>());
+        Assert.That(loads, Is.EqualTo(1));
+
+        time.Now += TimeSpan.FromSeconds(1);
         Assert.That(await value.GetAsync(), Is.EqualTo(2));
     }
 
@@ -147,8 +155,104 @@ public class RefreshingValueTests
         Assert.That(await value.GetAsync(), Is.EqualTo(1));
         time.Now += TimeSpan.FromMinutes(5);
         Assert.That(await value.GetAsync(), Is.EqualTo(1));
+        await WaitFor(() => Task.FromResult(Volatile.Read(ref loads)), n => n == 2);
+        await Task.Delay(20);
 
-        // The failed refresh is not retried until the next call, which still gets the old value.
+        // The failed refresh is retried once the backoff has passed; until then the old value is served.
+        time.Now += RefreshingValue<int>.InitialBackoff;
         Assert.That(await WaitFor(() => value.GetAsync(), v => v == 3), Is.EqualTo(3));
     }
+
+    [Test]
+    public async Task GetAsync_RefreshKeepsFailing_BacksOffDoublingUpToTheLifetime()
+    {
+        var time = new FakeTimeProvider();
+        var lifetime = TimeSpan.FromMinutes(5);
+        var loads = 0;
+        using var value = new RefreshingValue<int>(_ =>
+        {
+            var n = Interlocked.Increment(ref loads);
+            return n > 1 ? throw new HttpRequestException("down") : Task.FromResult(n);
+        }, lifetime, time);
+
+        await value.GetAsync();
+        time.Now += lifetime;
+
+        // 30s, 60s, 120s, 240s, then capped at the 5-minute lifetime.
+        var expected = new[] { 30, 60, 120, 240, 300, 300 }.Select(s => TimeSpan.FromSeconds(s));
+        var attempts = 1;
+        foreach (var delay in expected)
+        {
+            await value.GetAsync();
+            attempts++;
+            await WaitFor(() => Task.FromResult(Volatile.Read(ref loads)), n => n == attempts);
+            // Let the failed load record its backoff before the clock moves.
+            await Task.Delay(20);
+
+            time.Now += delay - TimeSpan.FromSeconds(1);
+            for (var i = 0; i < 5; i++)
+            {
+                Assert.That(await value.GetAsync(), Is.EqualTo(1));
+            }
+
+            await Task.Delay(20);
+            Assert.That(loads, Is.EqualTo(attempts), $"retried before the {delay} backoff ended");
+            time.Now += TimeSpan.FromSeconds(1);
+        }
+    }
+
+    [Test]
+    public async Task GetAsync_RefreshFails_LogsTheFailure()
+    {
+        var time = new FakeTimeProvider();
+        var logger = new Mock<ILogger>();
+        var loads = 0;
+        var error = new HttpRequestException("down");
+        using var value = new RefreshingValue<int>(_ =>
+        {
+            var n = Interlocked.Increment(ref loads);
+            return n > 1 ? throw error : Task.FromResult(n);
+        }, TimeSpan.FromMinutes(5), time, logger.Object, description: "asset ID listing");
+
+        await value.GetAsync();
+        time.Now += TimeSpan.FromMinutes(5);
+        await value.GetAsync();
+        await WaitFor(() => Task.FromResult(Volatile.Read(ref loads)), n => n == 2);
+        await Task.Delay(20);
+
+        logger.Verify(l => l.Log(LogLevel.Warning, It.IsAny<EventId>(),
+            It.Is<It.IsAnyType>((state, _) => state.ToString()!.Contains("asset ID listing")),
+            error, It.IsAny<Func<It.IsAnyType, Exception?, string>>()), Times.Once);
+    }
+
+    [Test]
+    public async Task GetAsync_ServedValueOlderThanMaxAge_WarnsOnce()
+    {
+        var time = new FakeTimeProvider();
+        var logger = new Mock<ILogger>();
+        var loads = 0;
+        using var value = new RefreshingValue<int>(_ =>
+        {
+            var n = Interlocked.Increment(ref loads);
+            return n > 1 ? throw new HttpRequestException("down") : Task.FromResult(n);
+        }, TimeSpan.FromMinutes(5), time, logger.Object, maxAge: TimeSpan.FromMinutes(20));
+
+        await value.GetAsync();
+        time.Now += TimeSpan.FromMinutes(20);
+        await value.GetAsync();
+        VerifyStaleWarnings(logger, Times.Never());
+
+        for (var i = 0; i < 3; i++)
+        {
+            time.Now += TimeSpan.FromMinutes(5);
+            Assert.That(await value.GetAsync(), Is.EqualTo(1));
+        }
+
+        VerifyStaleWarnings(logger, Times.Once());
+    }
+
+    private static void VerifyStaleWarnings(Mock<ILogger> logger, Times times) =>
+        logger.Verify(l => l.Log(LogLevel.Warning, It.IsAny<EventId>(),
+            It.Is<It.IsAnyType>((state, _) => state.ToString()!.Contains("Still serving")),
+            null, It.IsAny<Func<It.IsAnyType, Exception?, string>>()), times);
 }

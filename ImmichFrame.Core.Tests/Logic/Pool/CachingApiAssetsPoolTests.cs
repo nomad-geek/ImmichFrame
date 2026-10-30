@@ -172,6 +172,33 @@ public class CachingApiAssetsPoolTests
     }
 
     [Test]
+    public async Task GetAllAssetIds_OlderLoadSeenLater_KeepsTheNewerIndex()
+    {
+        IEnumerable<AssetResponseDto>? cached = null;
+        _mockApiCache.Setup(c => c.GetOrAddAsync(
+                It.IsAny<string>(),
+                It.IsAny<Func<Task<IEnumerable<AssetResponseDto>>>>()
+            ))
+            .Returns<string, Func<Task<IEnumerable<AssetResponseDto>>>>(async (key, factory) => cached ??= await factory());
+        var older = CreateSampleAssets();
+        var newer = older.Skip(2).ToList();
+
+        _testPool.LoadAssetsFunc = () => Task.FromResult<IEnumerable<AssetResponseDto>>(older);
+        var first = await _testPool.GetAllAssetIds();
+        cached = null;
+        _testPool.LoadAssetsFunc = () => Task.FromResult<IEnumerable<AssetResponseDto>>(newer);
+        var second = await _testPool.GetAllAssetIds();
+
+        // A caller still holding the older list (read before the cache reloaded) arrives last.
+        cached = older;
+        var third = await _testPool.GetAllAssetIds();
+
+        Assert.That(second.Version, Is.GreaterThan(first.Version));
+        Assert.That(third, Is.SameAs(second));
+        Assert.That(third.Ids, Is.EquivalentTo(newer.Select(a => a.Id)));
+    }
+
+    [Test]
     public async Task LoadAssetsByIds_LooksUpIdsInOrderAndLeavesOutUnknown()
     {
         var assets = CreateSampleAssets();

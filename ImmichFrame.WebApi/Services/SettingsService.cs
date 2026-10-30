@@ -106,7 +106,7 @@ public class SettingsService : ISettingsProvider
     /// API anyone who can reach the port can drive that cost.
     /// </summary>
     internal static bool ExhaustiveWithoutSecret(IServerSettings settings) =>
-        string.IsNullOrEmpty(settings.GeneralSettings.AuthenticationSecret)
+        settings.GeneralSettings.AuthenticationSecret == null
         && settings.Accounts.Any(a => a.ShuffleMode == ShuffleMode.Exhaustive);
 
     private void WarnIfExhaustiveWithoutSecret(IServerSettings settings)
