@@ -1,0 +1,27 @@
+{
+  "$comment": "Test tiers for this repo, read by an external, project-agnostic tier runner that mounts the repo root at /code in throwaway containers. light: the web app's svelte-check (npm ci with --ignore-scripts, so no dependency install script runs), then dotnet test for both test projects. Both steps copy what they need to /tmp first, so bin/, obj/, node_modules and anything an install script writes never land in the working tree. Both steps need network access for npm ci and dotnet restore. No services: the tests mock the Immich API. Lint (prettier, eslint) is left out: the upstream tree is not lint-clean and its CI does not enforce it.",
+  "format": "test-tiers/v1",
+  "tiers": {
+    "light": {
+      "image": "mcr.microsoft.com/dotnet/sdk:8.0@sha256:6ba9644da07bb5b560a402acec9ca38711a0762969f1b61da261df5c9f6f85da",
+      "workdir": "/code",
+      "memory": "1280m",
+      "env": {
+        "DOTNET_CLI_HOME": "/tmp/dotnet-home",
+        "NUGET_PACKAGES": "/tmp/nuget",
+        "DOTNET_NOLOGO": "1",
+        "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+        "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1"
+      },
+      "run": "set -e; mkdir -p /tmp/src; tar -C /code --exclude=./.git --exclude=./.claude --exclude=./.scratch --exclude='./immichFrame.Web/node_modules' --exclude='./docs/node_modules' --exclude='*/bin' --exclude='*/obj' -cf - . | tar -C /tmp/src -xf -; cd /tmp/src; dotnet test ImmichFrame.Core.Tests/ImmichFrame.Core.Tests.csproj; dotnet test ImmichFrame.WebApi.Tests/ImmichFrame.WebApi.Tests.csproj",
+      "extra": [
+        {
+          "image": "mirror.gcr.io/library/node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da",
+          "workdir": "/code",
+          "memory": "768m",
+          "run": "set -e; export npm_config_cache=/tmp/npm-cache npm_config_update_notifier=false CI=true NODE_OPTIONS=--max-old-space-size=1024; mkdir -p /tmp/web; tar -C /code/immichFrame.Web --exclude=./node_modules --exclude=./.svelte-kit -cf - . | tar -C /tmp/web -xf -; cd /tmp/web; npm ci --ignore-scripts --no-audit --no-fund; npm run check"
+        }
+      ]
+    }
+  }
+}
