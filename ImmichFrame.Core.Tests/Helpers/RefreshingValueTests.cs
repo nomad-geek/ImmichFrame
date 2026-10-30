@@ -202,7 +202,7 @@ public class RefreshingValueTests
     }
 
     [Test]
-    public async Task GetAsync_NoValueAndLoadKeepsFailing_NeverWaitsLongerThanTheFloor()
+    public void GetAsync_NoValueAndLoadKeepsFailing_NeverWaitsLongerThanTheFloor()
     {
         var time = new FakeTimeProvider();
         var loads = 0;
